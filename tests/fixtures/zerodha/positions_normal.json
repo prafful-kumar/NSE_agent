@@ -1,0 +1,33 @@
+{
+  "day": [],
+  "net": [
+    {
+      "tradingsymbol": "RELIANCE",
+      "exchange": "NSE",
+      "product": "CNC",
+      "quantity": 10,
+      "buy_quantity": 10,
+      "sell_quantity": 0,
+      "buy_price": 2450.0,
+      "sell_price": 0.0,
+      "last_price": 2680.0,
+      "pnl": 2300.0,
+      "realised": 0.0,
+      "unrealised": 2300.0
+    },
+    {
+      "tradingsymbol": "HDFCBANK",
+      "exchange": "NSE",
+      "product": "CNC",
+      "quantity": 20,
+      "buy_quantity": 20,
+      "sell_quantity": 0,
+      "buy_price": 1480.0,
+      "sell_price": 0.0,
+      "last_price": 1620.0,
+      "pnl": 2800.0,
+      "realised": 0.0,
+      "unrealised": 2800.0
+    }
+  ]
+}

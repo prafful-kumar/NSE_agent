@@ -1,17 +1,14 @@
 from __future__ import annotations
-"""LangGraph research graph.
 
-Phase 1 graph: router -> [portfolio | memory | events] -> decision
-Later phases add: facts, news, earnings_estimator, valuation, risk, approval_interrupt
+"""LangGraph research graph — Phase 2.
 
-The graph is compiled without a checkpointer in Phase 1.
-Phase 2 will add PostgreSQL checkpointer for persistence across sessions.
+Portfolio node now reads from PostgreSQL (not directly from broker).
+Sync is triggered by CLI or API, not by agent queries.
 
-Human-in-the-loop (approval interrupt) is wired but only active when
-requires_approval=True and broker execution is enabled.
+Phase 1 nodes still present as stubs:
+  facts, earnings_estimator, valuation, risk (→ Phase 3–6)
 """
 
-from functools import partial
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -22,61 +19,47 @@ from investing_agent.agents.nodes.portfolio import portfolio_node
 from investing_agent.agents.nodes.router import route_after_router, router_node
 from investing_agent.agents.state import InvestmentState
 from investing_agent.config.logging import get_logger
-from investing_agent.gateway.base import BrokerGateway
-from investing_agent.gateway.mock import MockBrokerGateway
 
 log = get_logger(__name__)
 
 
 def _stub_events_node(state: InvestmentState) -> dict[str, Any]:
-    """Phase 1 stub: corporate events node returns empty list.
-    Phase 4 will fetch from exchange sources."""
     return {"corporate_events": []}
 
 
 def _stub_facts_node(state: InvestmentState) -> dict[str, Any]:
-    """Phase 1 stub: fundamentals/filings node.
-    Phase 3 will fetch from NSE/BSE filings."""
     return {}
 
 
-def _stub_response_node(state: InvestmentState) -> dict[str, Any]:
-    """Format the final response (placeholder for Phase 1)."""
-    return {}
-
-
-def build_graph(
-    broker: BrokerGateway | None = None,
-    session_factory: Any = None,
-) -> Any:
+def build_graph(session_factory: Any = None) -> Any:
     """Build and compile the investment research graph.
 
     Args:
-        broker: BrokerGateway instance. Defaults to MockBrokerGateway.
-        session_factory: Async SQLAlchemy session factory.
-            Required for memory_node in production.
+        session_factory: async SQLAlchemy session factory (AsyncSessionLocal).
+            Required for portfolio and memory nodes.
 
     Returns:
         Compiled LangGraph runnable.
     """
-    if broker is None:
-        broker = MockBrokerGateway()
-
     workflow = StateGraph(InvestmentState)
 
     # ── Node registration ─────────────────────────────────────────────────────
     workflow.add_node("router", router_node)
 
-    # Portfolio node needs the broker injected
+    # Portfolio node reads from DB
     async def _portfolio(state: InvestmentState) -> dict[str, Any]:
-        return await portfolio_node(state, broker=broker)
+        if session_factory is None:
+            log.warning("portfolio_node.no_session_factory")
+            return {"portfolio": None, "errors": ["No database session available."]}
+        async with session_factory() as session:
+            return await portfolio_node(state, session=session)
 
     workflow.add_node("portfolio", _portfolio)
 
-    # Memory node needs a DB session
+    # Memory node reads theses + user profile from DB
     async def _memory(state: InvestmentState) -> dict[str, Any]:
         if session_factory is None:
-            log.warning("memory_node.no_session_factory", msg="Memory node returning empty profile")
+            log.warning("memory_node.no_session_factory")
             return {"user_profile": {}, "company_facts": {}}
         async with session_factory() as session:
             return await memory_node(state, session=session)

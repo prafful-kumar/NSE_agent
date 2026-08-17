@@ -1,0 +1,4 @@
+{
+  "_scenario": "auth_expired",
+  "_description": "This fixture represents a 401 auth error. Not loaded as data — used to document the expected error scenario. MockPortfolioReader scenario='auth_expired' raises BrokerAuthError."
+}

@@ -86,6 +86,18 @@ class PortfolioRepository(BaseRepository[PortfolioSnapshot]):
         await self.session.flush()
         return snapshot
 
+    async def get_history(
+        self, user_id: str, limit: int = 30
+    ) -> list[PortfolioSnapshot]:
+        """Return recent snapshots ordered by date descending."""
+        result = await self.session.execute(
+            select(PortfolioSnapshot)
+            .where(PortfolioSnapshot.user_id == user_id)
+            .order_by(desc(PortfolioSnapshot.snapshot_date), desc(PortfolioSnapshot.created_at))
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
     async def get_portfolio_symbols(self, user_id: str) -> list[str]:
         """Return current portfolio symbols (from latest snapshot)."""
         snapshot = await self.get_latest(user_id)

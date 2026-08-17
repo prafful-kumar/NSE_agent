@@ -1,0 +1,4 @@
+{
+  "_scenario": "unavailable",
+  "_description": "This fixture documents the broker-unavailable scenario. MockPortfolioReader scenario='unavailable' raises BrokerUnavailableError."
+}

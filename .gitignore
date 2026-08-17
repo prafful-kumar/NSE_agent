@@ -38,3 +38,7 @@ logs/
 
 # Docker
 docker-compose.override.yml
+
+# Venv
+.venv/
+.venv312/

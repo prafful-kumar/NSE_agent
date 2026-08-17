@@ -1,5 +1,11 @@
 from __future__ import annotations
-"""FastAPI dependency injection."""
+
+"""FastAPI dependency injection — Phase 2.
+
+PortfolioReader is injected into portfolio-related routes.
+BrokerExecutor is intentionally NOT injected here — it is only used in the
+human-approval node (Phase 8) after explicit user confirmation.
+"""
 
 from collections.abc import AsyncGenerator
 from typing import Annotated
@@ -9,8 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from investing_agent.config.settings import Settings, get_settings
 from investing_agent.db.session import AsyncSessionLocal
-from investing_agent.gateway.base import BrokerGateway
-from investing_agent.gateway.mock import MockBrokerGateway
+from investing_agent.gateway.portfolio_reader import PortfolioReader
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -23,16 +28,28 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
-def get_broker(settings: Annotated[Settings, Depends(get_settings)]) -> BrokerGateway:
-    """Return the appropriate broker gateway.
+def get_portfolio_reader(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> PortfolioReader:
+    """Return the configured PortfolioReader (read-only, never executes trades).
 
-    In Phase 1 we always return MockBrokerGateway.
-    Phase 2 will conditionally return ZerodhaKiteMCPGateway when credentials are set.
+    Uses ZerodhaKiteMCPReader when ZERODHA_ACCESS_TOKEN is set;
+    falls back to MockPortfolioReader otherwise.
     """
-    return MockBrokerGateway(execution_enabled=settings.broker_execution_enabled)
+    if settings.zerodha_access_token:
+        from investing_agent.gateway.zerodha_reader import ZerodhaKiteMCPReader
+        return ZerodhaKiteMCPReader(settings)
+
+    from investing_agent.gateway.mock_reader import MockPortfolioReader
+    return MockPortfolioReader(scenario="normal")
 
 
-# Type aliases for annotated dependencies
+# ── Type aliases ───────────────────────────────────────────────────────────────
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
-BrokerDep = Annotated[BrokerGateway, Depends(get_broker)]
+PortfolioReaderDep = Annotated[PortfolioReader, Depends(get_portfolio_reader)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+# Keep BrokerDep as an alias pointing to PortfolioReader for backward compat
+# with any existing routes that imported BrokerDep before Phase 2.
+BrokerDep = PortfolioReaderDep

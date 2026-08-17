@@ -1,0 +1,20 @@
+{
+  "holdings": [
+    {
+      "tradingsymbol": "SOMECO",
+      "exchange": "NSE",
+      "isin": "INE999X99999",
+      "quantity": 10,
+      "t1_quantity": 0,
+      "realised_quantity": 10,
+      "average_price": 100.0,
+      "last_price": 0.0,
+      "close_price": 0.0,
+      "pnl": 0.0,
+      "day_change": 0.0,
+      "day_change_percentage": 0.0,
+      "product": "CNC",
+      "instrument_type": "EQ"
+    }
+  ]
+}

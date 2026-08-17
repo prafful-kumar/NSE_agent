@@ -1,0 +1,68 @@
+{
+  "holdings": [
+    {
+      "tradingsymbol": "RELIANCE",
+      "exchange": "NSE",
+      "isin": "INE002A01018",
+      "quantity": 10,
+      "t1_quantity": 0,
+      "realised_quantity": 10,
+      "average_price": 2450.0,
+      "last_price": 2680.0,
+      "close_price": 2660.0,
+      "pnl": 2300.0,
+      "day_change": 20.0,
+      "day_change_percentage": 0.75,
+      "product": "CNC",
+      "instrument_type": "EQ"
+    },
+    {
+      "tradingsymbol": "HDFCBANK",
+      "exchange": "NSE",
+      "isin": "INE040A01034",
+      "quantity": 20,
+      "t1_quantity": 0,
+      "realised_quantity": 20,
+      "average_price": 1480.0,
+      "last_price": 1620.0,
+      "close_price": 1610.0,
+      "pnl": 2800.0,
+      "day_change": 10.0,
+      "day_change_percentage": 0.62,
+      "product": "CNC",
+      "instrument_type": "EQ"
+    },
+    {
+      "tradingsymbol": "BEL",
+      "exchange": "NSE",
+      "isin": "INE263A01024",
+      "quantity": 200,
+      "t1_quantity": 0,
+      "realised_quantity": 200,
+      "average_price": 180.0,
+      "last_price": 215.0,
+      "close_price": 210.0,
+      "pnl": 7000.0,
+      "day_change": 5.0,
+      "day_change_percentage": 2.38,
+      "product": "CNC",
+      "instrument_type": "EQ"
+    },
+    {
+      "tradingsymbol": "HAL",
+      "exchange": "NSE",
+      "isin": "INE066F01012",
+      "quantity": 5,
+      "t1_quantity": 0,
+      "realised_quantity": 5,
+      "average_price": 2800.0,
+      "last_price": 3400.0,
+      "close_price": 3380.0,
+      "pnl": 3000.0,
+      "day_change": 20.0,
+      "day_change_percentage": 0.59,
+      "product": "CNC",
+      "instrument_type": "EQ"
+    }
+  ]
+}

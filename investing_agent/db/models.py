@@ -376,3 +376,36 @@ class Recommendation(TimestampMixin, Base):
 
     human_approved: Mapped[bool | None] = mapped_column(Boolean)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ── Instrument master ─────────────────────────────────────────────────────────
+
+class InstrumentMaster(TimestampMixin, Base):
+    """Maps broker instrument identifiers to internal company_id.
+
+    ISIN is the durable identity.  Broker tokens and trading symbols can change.
+    Resolution priority: ISIN → symbol+exchange → create new company stub.
+    """
+
+    __tablename__ = "instrument_master"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tradingsymbol: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    exchange: Mapped[str] = mapped_column(String(10), nullable=False)  # NSE | BSE
+    isin: Mapped[str | None] = mapped_column(String(20), index=True)
+    # EQ | ETF | MF | BE | BL | GB | GS | INDEX | OTHER
+    instrument_type: Mapped[str] = mapped_column(String(20), nullable=False, default="EQ")
+    zerodha_instrument_token: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    company: Mapped["Company | None"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("tradingsymbol", "exchange", name="uq_instrument_symbol_exchange"),
+    )

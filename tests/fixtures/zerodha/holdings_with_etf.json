@@ -1,0 +1,36 @@
+{
+  "holdings": [
+    {
+      "tradingsymbol": "RELIANCE",
+      "exchange": "NSE",
+      "isin": "INE002A01018",
+      "quantity": 10,
+      "t1_quantity": 0,
+      "realised_quantity": 10,
+      "average_price": 2450.0,
+      "last_price": 2680.0,
+      "close_price": 2660.0,
+      "pnl": 2300.0,
+      "day_change": 20.0,
+      "day_change_percentage": 0.75,
+      "product": "CNC",
+      "instrument_type": "EQ"
+    },
+    {
+      "tradingsymbol": "NIFTYBEES",
+      "exchange": "NSE",
+      "isin": "INF204KB12I2",
+      "quantity": 100,
+      "t1_quantity": 0,
+      "realised_quantity": 100,
+      "average_price": 240.0,
+      "last_price": 260.0,
+      "close_price": 258.0,
+      "pnl": 2000.0,
+      "day_change": 2.0,
+      "day_change_percentage": 0.78,
+      "product": "CNC",
+      "instrument_type": "ETF"
+    }
+  ]
+}
