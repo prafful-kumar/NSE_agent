@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "investing-agent"
+version = "0.1.0"
+description = "Long-term Indian equity investment research agent"
+requires-python = ">=3.9"
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+
+    # Validation & settings
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+
+    # Database
+    "sqlalchemy>=2.0.30",
+    "alembic>=1.13.0",
+    "psycopg[binary,pool]>=3.1.0",
+    "pgvector>=0.3.0",
+
+    # LangGraph / LangChain
+    "langgraph>=0.2.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
+    "langchain>=0.2.0",
+    "langchain-core>=0.2.0",
+    "langchain-anthropic>=0.1.0",
+    "langchain-mcp-adapters>=0.1.0",
+
+    # LLM
+    "anthropic>=0.30.0",
+
+    # Data
+    "pandas>=2.2.0",
+
+    # Logging
+    "structlog>=24.1.0",
+
+    # HTTP
+    "httpx>=0.27.0",
+
+    # Resilience
+    "tenacity>=8.3.0",
+
+    # Env
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "mypy>=1.10.0",
+    "ruff>=0.6.0",
+    "factory-boy>=3.3.0",
+    "faker>=26.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["investing_agent*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a running PostgreSQL instance",
+    "injection: prompt-injection security tests",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true

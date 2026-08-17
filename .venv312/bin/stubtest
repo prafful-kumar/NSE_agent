@@ -1,0 +1,6 @@
+#!/Users/praffulkhoba/Downloads/long_term_investing_agent/investing-agent/.venv312/bin/python3.12
+import sys
+from mypy.stubtest import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
