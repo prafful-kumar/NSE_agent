@@ -937,3 +937,292 @@ class ExtractionCandidate(TimestampMixin, Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reviewed_by: Mapped[str | None] = mapped_column(String(100))
     resulting_record_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
+
+# ── Phase 4A: news ingestion + relational research memory ────────────────────
+# Deliberately relational-first, no embeddings/vector retrieval — see
+# services/embeddings/interfaces.py for the unwired EmbeddingProvider stub.
+# News rows carry only feed-provided metadata (headline/snippet/URL), never
+# scraped article bodies — see the Phase 4 bake-off, REPORT.md §12.5, for the
+# licensing reasoning. Google News stays disabled/research_only pending a
+# licensing decision (SourceReliability.research_only).
+
+
+class CompanyAlias(TimestampMixin, Base):
+    """Deterministic company-name/ticker aliases for news/text matching.
+
+    Ticker-only aliases for symbols that collide with common words or names
+    (e.g. HAL — "Hal" as a generic first name / HBO's *Lanterns* character;
+    see the Phase 4 bake-off, REPORT.md §12.2) get a lower match_confidence
+    than full-name aliases, so a bare-ticker hit alone downgrades the
+    resulting NewsCompanyLink instead of being trusted outright. Never
+    inferred automatically — every row here is asserted, not learned.
+    """
+
+    __tablename__ = "company_aliases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    alias: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    alias_type: Mapped[str] = mapped_column(String(20), nullable=False)  # symbol|full_name|short_name
+    match_confidence: Mapped[Decimal] = mapped_column(
+        Numeric(3, 2), nullable=False, default=Decimal("1.00")
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("company_id", "alias", name="uq_company_alias_company_alias"),
+    )
+
+
+class NewsItem(TimestampMixin, Base):
+    """One RSS/feed entry, minimally normalized. Only feed-provided fields
+    are stored — headline, short snippet, publisher, URL — never the full
+    article body (no scraping, no paywall bypass; see REPORT.md §12.5).
+
+    content_hash is a hash of the normalized headline, used for exact/near
+    duplicate detection (services/news/dedup.py). Re-polling identity is the
+    (source_name, source_url) unique constraint below, not content_hash — a
+    feed item keeps the same URL across polls even if wording is re-cased.
+    """
+
+    __tablename__ = "news_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    headline: Mapped[str] = mapped_column(String(1000), nullable=False)
+    feed_description: Mapped[str | None] = mapped_column(Text)
+    publisher: Mapped[str | None] = mapped_column(String(255))
+    # livemint|economic_times|google_news|manual
+    source_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_url: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    raw_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    __table_args__ = (
+        UniqueConstraint("source_name", "source_url", name="uq_news_item_source_url"),
+    )
+
+
+class NewsEvent(TimestampMixin, Base):
+    """Deterministic cluster of NewsItems judged to describe the same
+    underlying real-world event (e.g. one order win reported by ET,
+    LiveMint, and Google News). See services/news/dedup.py for the
+    clustering heuristic — normalized headline similarity + same company +
+    close publication time. No LLM anywhere in Phase 4A.
+    """
+
+    __tablename__ = "news_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # order_win|guidance|management_change|regulatory|capacity|other|unclassified
+    event_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="unclassified", index=True
+    )
+    primary_company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
+    )
+    event_date: Mapped[date | None] = mapped_column(Date, index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Phase 4B will add an importance classifier; unclassified until then.
+    importance: Mapped[str] = mapped_column(String(20), nullable=False, default="unclassified")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")  # active|stale
+    representative_headline: Mapped[str] = mapped_column(String(1000), nullable=False)
+
+
+class NewsEventItem(TimestampMixin, Base):
+    """Join table: which NewsItems belong to which NewsEvent cluster."""
+
+    __tablename__ = "news_event_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    news_event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_events.id"), index=True, nullable=False
+    )
+    news_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_items.id"), index=True, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("news_event_id", "news_item_id", name="uq_news_event_item"),
+    )
+
+
+class NewsCompanyLink(TimestampMixin, Base):
+    """Which companies a NewsItem is relevant to, and how confidently.
+    relevance_score comes from the matching CompanyAlias.match_confidence —
+    a bare ambiguous-ticker hit (e.g. HAL) always links at a low score
+    rather than being silently dropped, so downstream consumers can filter
+    on relevance_score rather than the matcher making that call for them.
+    """
+
+    __tablename__ = "news_company_links"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    news_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_items.id"), index=True, nullable=False
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    relevance_score: Mapped[Decimal] = mapped_column(Numeric(3, 2), nullable=False)
+    # alias_full_name|alias_short_name|alias_symbol|alias_symbol_ambiguous|manual
+    match_method: Mapped[str] = mapped_column(String(30), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("news_item_id", "company_id", name="uq_news_company_link"),
+    )
+
+
+class ResearchNote(TimestampMixin, Base):
+    """A human-entered research observation, optionally tied to a source
+    document or a clustered news event. effective_at is the point-in-time
+    this note is *about* (usually == created_at, but can be backdated when
+    entering historical context)."""
+
+    __tablename__ = "research_notes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    note_type: Mapped[str] = mapped_column(String(30), nullable=False, default="manual")
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True
+    )
+    news_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_events.id"), index=True
+    )
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+
+
+class ThesisChange(TimestampMixin, Base):
+    """An explicit record of what changed about an investment thesis and
+    why — always citing evidence (a news event and/or a research note),
+    never a bare assertion."""
+
+    __tablename__ = "thesis_changes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    thesis_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("investment_theses.id"), index=True
+    )
+    # initiated|reason_added|risk_added|catalyst_added|target_changed|status_changed|exited|other
+    change_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_news_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_events.id"), index=True
+    )
+    evidence_research_note_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("research_notes.id"), index=True
+    )
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class Catalyst(TimestampMixin, Base):
+    """A forward-looking positive trigger being tracked for a company.
+    expected_by is free text, never parsed to a date (same convention as
+    OrderBookSnapshot.expected_execution_period) — companies and analysts
+    rarely give a precise date, and inventing one would be a fabrication."""
+
+    __tablename__ = "catalysts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    catalyst_type: Mapped[str] = mapped_column(String(50), nullable=False, default="other")
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", index=True
+    )  # active|realized|expired|invalidated
+    expected_by: Mapped[str | None] = mapped_column(String(255))
+    news_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_events.id"), index=True
+    )
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True
+    )
+
+
+class RiskObservation(TimestampMixin, Base):
+    """A tracked negative/risk factor for a company, mirroring Catalyst's
+    shape on the downside."""
+
+    __tablename__ = "risk_observations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    risk_type: Mapped[str] = mapped_column(String(50), nullable=False, default="other")
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="unclassified")
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", index=True
+    )  # active|resolved|monitoring
+    news_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_events.id"), index=True
+    )
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True
+    )
+
+
+class SourceReliability(TimestampMixin, Base):
+    """Operational quality tracking per news source — fetch success/failure,
+    staleness, duplicate/relevance rates. Deliberately does NOT score a
+    publisher as "good/bad for investing" (that's an editorial judgment out
+    of scope for Phase 4A); this is purely operational health.
+
+    enabled/research_only gate whether NewsIngestionService.sync will poll a
+    source at all — Google News ships with enabled=False, research_only=True
+    per the bake-off licensing caveat (REPORT.md §12.5), never wired into
+    the CLI scheduler default.
+    """
+
+    __tablename__ = "source_reliability"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_name: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    research_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    successful_fetches: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_fetches: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stale_feed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    duplicate_rate: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    company_relevance_rate: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

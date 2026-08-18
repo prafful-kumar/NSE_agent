@@ -19,6 +19,9 @@ from investing_agent.agents.nodes.factual_company_context import (
 )
 from investing_agent.agents.nodes.memory import memory_node
 from investing_agent.agents.nodes.portfolio import portfolio_node
+from investing_agent.agents.nodes.research_memory_context import (
+    research_memory_context_node,
+)
 from investing_agent.agents.nodes.router import route_after_router, router_node
 from investing_agent.agents.state import InvestmentState
 from investing_agent.config.logging import get_logger
@@ -76,6 +79,17 @@ def build_graph(session_factory: Any = None) -> Any:
             return await factual_company_context_node(state, session=session)
 
     workflow.add_node("facts", _facts)
+
+    # research_memory_context reads Phase 4A news/research-memory tables
+    # from PostgreSQL only — it never polls RSS feeds during reasoning.
+    async def _research_memory(state: InvestmentState) -> dict[str, Any]:
+        if session_factory is None:
+            log.warning("research_memory_context_node.no_session_factory")
+            return {}
+        async with session_factory() as session:
+            return await research_memory_context_node(state, session=session)
+
+    workflow.add_node("research_memory", _research_memory)
     workflow.add_node("decision", decision_node)
 
     # ── Entry point ───────────────────────────────────────────────────────────
@@ -95,7 +109,8 @@ def build_graph(session_factory: Any = None) -> Any:
     # ── Standard flow ─────────────────────────────────────────────────────────
     workflow.add_edge("portfolio", "decision")
     workflow.add_edge("memory", "facts")
-    workflow.add_edge("facts", "events")
+    workflow.add_edge("facts", "research_memory")
+    workflow.add_edge("research_memory", "events")
     workflow.add_edge("events", "decision")
     workflow.add_edge("decision", END)
 

@@ -835,6 +835,237 @@ async def _record_commentary(symbol, source_document_id, quote, speaker, topic, 
     click.echo(f"  id: {row.id}  verification_status={row.verification_status}")
 
 
+# ── Phase 4A: news ingestion + research memory ───────────────────────────────
+#
+# Only livemint/economic_times are production-enabled here — Google News
+# stays behind services/sources/google_news_source.py, never registered in
+# _NEWS_SOURCES, pending the licensing decision (see db/models.py Phase 4A
+# section header). Continuous polling (not one-shot ticker lookup) is what
+# made LiveMint/ET useful in the bake-off; run sync-news on a schedule
+# (cron/APScheduler later), not as a single ad hoc query.
+
+_NEWS_SOURCES: dict[str, type] = {}
+
+
+def _news_sources() -> dict[str, type]:
+    if not _NEWS_SOURCES:
+        from investing_agent.services.sources.economic_times_source import (
+            EconomicTimesNewsSource,
+        )
+        from investing_agent.services.sources.livemint_source import LiveMintNewsSource
+
+        _NEWS_SOURCES["livemint"] = LiveMintNewsSource
+        _NEWS_SOURCES["economic_times"] = EconomicTimesNewsSource
+    return _NEWS_SOURCES
+
+
+@cli.command("sync-news")
+@click.option(
+    "--source", "source_name", default=None,
+    type=click.Choice(["livemint", "economic_times"]),
+    help="Sync only this source; omit to sync all production-enabled sources",
+)
+@click.option(
+    "--company", "company_symbol", default=None,
+    help="After syncing, print recent NewsEvents for this company symbol",
+)
+def sync_news_cmd(source_name: str | None, company_symbol: str | None) -> None:
+    """Poll LiveMint / Economic Times RSS, dedup, match to companies, and
+    cluster into NewsEvents. Google News is not wired here — see
+    services/sources/google_news_source.py.
+
+    \b
+    Pipeline:
+        RSS fetch -> exact/near-dup filter -> archive metadata -> company
+        match (CompanyAlias) -> NewsEvent clustering
+    """
+    asyncio.run(_sync_news(source_name, company_symbol))
+
+
+async def _sync_news(source_name: str | None, company_symbol: str | None) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.news import NewsIngestionService
+
+    sources = _news_sources()
+    names = [source_name] if source_name else list(sources.keys())
+
+    for name in names:
+        async with AsyncSessionLocal() as session:
+            source = sources[name]()
+            service = NewsIngestionService(session, source)
+            try:
+                result = await service.sync()
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                click.echo(f"  ERROR ({name}): {exc}", err=True)
+                sys.exit(1)
+            finally:
+                await service.aclose()
+
+        click.echo(f"\nNews sync — {name}")
+        click.echo(f"  Discovered              : {result.items_discovered}")
+        click.echo(f"  New items               : {result.items_created}")
+        click.echo(f"  Duplicates (exact/near) : {result.items_duplicate}")
+        click.echo(f"  Company links created   : {result.company_links_created}")
+        click.echo(
+            f"  Events created/extended : {result.events_created}/{result.events_extended}"
+        )
+        if result.blocked:
+            click.echo("  WARNING: source signaled an access block — sync stopped early")
+        if result.stale:
+            click.echo("  WARNING: feed appears stale (newest item older than 48h)")
+
+    if company_symbol:
+        await _show_company_events(company_symbol)
+
+
+async def _show_company_events(symbol: str) -> None:
+    from investing_agent.db.repositories.company import CompanyRepository
+    from investing_agent.db.repositories.news import NewsEventRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        company = await CompanyRepository(session).get_by_symbol(symbol.upper())
+        if not company:
+            click.echo(f"\nNo company found for symbol '{symbol}'.")
+            return
+        events = await NewsEventRepository(session).list_by_company(company.id)
+
+    click.echo(f"\nRecent NewsEvents — {symbol} ({len(events)})")
+    for e in events[:15]:
+        click.echo(
+            f"  {e.id}  [{e.event_type:12s}] last_seen={e.last_seen_at.date()}  "
+            f"{e.representative_headline}"
+        )
+
+
+@cli.command("record-research-note")
+@click.argument("symbol")
+@click.option("--text", required=True, help="The note content")
+@click.option("--note-type", default="manual")
+@click.option(
+    "--effective-at", default=None, type=click.DateTime(formats=["%Y-%m-%d"]),
+    help="Defaults to now if omitted",
+)
+@click.option("--source-document-id", default=None)
+@click.option("--news-event-id", default=None)
+@click.option("--created-by", required=True)
+def record_research_note_cmd(
+    symbol: str, text: str, note_type: str, effective_at: datetime | None,
+    source_document_id: str | None, news_event_id: str | None, created_by: str,
+) -> None:
+    """Record a manual research note for SYMBOL — preserves an observation
+    even when it didn't come through automated ingestion."""
+    asyncio.run(_record_research_note(
+        symbol, text, note_type, effective_at, source_document_id, news_event_id, created_by,
+    ))
+
+
+async def _record_research_note(
+    symbol: str, text: str, note_type: str, effective_at: datetime | None,
+    source_document_id: str | None, news_event_id: str | None, created_by: str,
+) -> None:
+    from investing_agent.db.repositories.research_memory import ResearchNoteRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.research_memory import ResearchNoteCreate
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        data = ResearchNoteCreate(
+            company_id=company.id,
+            note_type=note_type,
+            text=text,
+            effective_at=effective_at or datetime.now(UTC),
+            source_document_id=uuid.UUID(source_document_id) if source_document_id else None,
+            news_event_id=uuid.UUID(news_event_id) if news_event_id else None,
+            created_by=created_by,
+        )
+        row = await ResearchNoteRepository(session).create(data)
+        await session.commit()
+
+    click.echo(f"\nRecorded research note — {symbol}")
+    click.echo(f"  id: {row.id}  effective_at={row.effective_at}")
+
+
+@cli.command("record-news-url")
+@click.argument("symbol")
+@click.option("--url", "source_url", required=True)
+@click.option("--headline", required=True)
+@click.option("--description", "feed_description", default=None)
+@click.option("--publisher", default=None)
+@click.option(
+    "--published-at", default=None, type=click.DateTime(formats=["%Y-%m-%d"]),
+)
+def record_news_url_cmd(
+    symbol: str, source_url: str, headline: str, feed_description: str | None,
+    publisher: str | None, published_at: datetime | None,
+) -> None:
+    """Manually preserve a news article that RSS discovery missed, linked to
+    SYMBOL. Stores only headline/description/URL metadata — never scraped
+    article text (same constraint as automated ingestion)."""
+    asyncio.run(_record_news_url(
+        symbol, source_url, headline, feed_description, publisher, published_at,
+    ))
+
+
+async def _record_news_url(
+    symbol: str, source_url: str, headline: str, feed_description: str | None,
+    publisher: str | None, published_at: datetime | None,
+) -> None:
+    from decimal import Decimal
+
+    from investing_agent.db.repositories.company_alias import CompanyAliasRepository
+    from investing_agent.db.repositories.news import NewsCompanyLinkRepository, NewsItemRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.news import NewsCompanyLinkCreate, NewsItemCreate
+    from investing_agent.services.dedup.news_dedup import compute_content_hash
+    from investing_agent.services.ingestion.news import cluster_event
+    from investing_agent.services.matching.company_matcher import CompanyMatcher
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        item_repo = NewsItemRepository(session)
+        content_hash = compute_content_hash("manual", headline)
+        item, created = await item_repo.get_or_create(
+            NewsItemCreate(
+                headline=headline, feed_description=feed_description, publisher=publisher,
+                source_name="manual", source_url=source_url,
+                published_at=published_at, content_hash=content_hash, raw_metadata=None,
+            )
+        )
+
+        link_repo = NewsCompanyLinkRepository(session)
+        await link_repo.get_or_create(
+            NewsCompanyLinkCreate(
+                news_item_id=item.id, company_id=company.id,
+                relevance_score=Decimal("1.00"), match_method="manual",
+            )
+        )
+
+        # Also run automated matching for any OTHER companies mentioned, so
+        # a manual entry participates in research-memory queries the same
+        # way an RSS-discovered one does.
+        alias_repo = CompanyAliasRepository(session)
+        matcher = CompanyMatcher(await alias_repo.list_active())
+        for match in matcher.match(f"{headline} {feed_description or ''}"):
+            if match.company_id == company.id:
+                continue
+            await link_repo.get_or_create(
+                NewsCompanyLinkCreate(
+                    news_item_id=item.id, company_id=match.company_id,
+                    relevance_score=match.relevance_score, match_method=match.match_method,
+                )
+            )
+
+        event, _event_created = await cluster_event(session, item, company.id)
+        await session.commit()
+
+    click.echo(f"\n{'Recorded' if created else 'Already recorded (idempotent)'} news item — {symbol}")
+    click.echo(f"  news_item_id : {item.id}")
+    click.echo(f"  news_event_id: {event.id}")
+
+
 def main() -> None:
     cli()
 
