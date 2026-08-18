@@ -1296,3 +1296,102 @@ class EventInterpretation(TimestampMixin, Base):
     resulting_thesis_change_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("thesis_changes.id")
     )
+
+
+# ── Phase 5A: earnings estimation (deterministic core + optional LLM narrative) ──
+
+class FeatureSnapshot(TimestampMixin, Base):
+    """The frozen information set an estimate was built from: everything
+    known about a company as of cutoff_at, for a specific target period.
+
+    Content-addressed by (company_id, financial_period_id, cutoff_at) — building
+    the same snapshot twice is idempotent, returning the existing row. This is
+    what makes point-in-time backtesting reproducible: re-running a different
+    model_version against an identical frozen snapshot is a fair comparison,
+    and the payload is the audit trail of exactly what data was available.
+
+    payload is a JSONB dict shaped like schemas.estimation.FeatureSnapshotPayload
+    (historical financials, order book, guidance, segment/operational metrics,
+    active catalysts/risks, recent news events) — everything the estimator saw,
+    nothing it didn't.
+    """
+
+    __tablename__ = "feature_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    financial_period_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True, nullable=False
+    )
+    cutoff_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id", "financial_period_id", "cutoff_at",
+            name="uq_feature_snapshot_company_period_cutoff",
+        ),
+    )
+
+
+class EstimateRun(TimestampMixin, Base):
+    """A single earnings estimate for one company/period, reproducible via
+    model_version + feature_snapshot_id.
+
+    Python calculates every numeric field here — revenue/ebitda_margin/pat/eps
+    low/base/high and confidence are always deterministically derived from
+    feature_snapshot_id's payload (see services/estimation/deterministic.py).
+    An optional LLM narrator may contribute qualitative assumptions/risks, but
+    its structured-output schema has no numeric fields at all (see
+    services/estimation/narrator.py), so it is structurally incapable of
+    overriding a number here — a stronger guarantee than a review gate.
+
+    A metric's low/base/high are all None when there isn't enough historical
+    data to support an estimate (fewer than 2 usable comparable periods) —
+    never a fabricated number, matching the codebase's existing
+    never-guess/UNRESOLVED discipline.
+
+    Immutable once created — this is model output, not a claim awaiting
+    human review (contrast EventInterpretation); DataCategory.ESTIMATE
+    already marks the epistemic status wherever this is surfaced.
+    """
+
+    __tablename__ = "estimate_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    financial_period_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True, nullable=False
+    )
+    cutoff_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    model_version: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    feature_snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("feature_snapshots.id"), index=True, nullable=False
+    )
+    revenue_low: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    revenue_base: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    revenue_high: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    ebitda_margin_low: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    ebitda_margin_base: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    ebitda_margin_high: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    pat_low: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    pat_base: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    pat_high: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    eps_low: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    eps_base: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    eps_high: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    # list[{"text": str, "source": "deterministic"|"llm"}]
+    assumptions: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)

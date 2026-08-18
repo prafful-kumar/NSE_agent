@@ -62,6 +62,20 @@ def resolve_fiscal_period(period_end: date) -> tuple[int, str, str]:
     return fiscal_year, quarter, label
 
 
+_QUARTER_END_MONTH_DAY = {1: (6, 30), 2: (9, 30), 3: (12, 31), 4: (3, 31)}
+
+
+def quarter_label_to_period_end(fiscal_year: int, quarter: str) -> date:
+    """Inverse of resolve_fiscal_period: the last calendar day of the given
+    Indian fiscal quarter. Q1-Q3 fall in the calendar year before
+    fiscal_year (Apr-Dec); Q4 (Jan-Mar) falls in fiscal_year itself —
+    e.g. quarter_label_to_period_end(2025, "Q3") == date(2024, 12, 31)."""
+    quarter_num = int(quarter[1])
+    month, day = _QUARTER_END_MONTH_DAY[quarter_num]
+    calendar_year = fiscal_year if quarter_num == 4 else fiscal_year - 1
+    return date(calendar_year, month, day)
+
+
 def resolve_reporting_basis(period_start: date | None, period_end: date | None) -> str:
     """QUARTER if the reported span is ~one quarter (<=100 days), else YTD.
     Derived from the dates themselves, never guessed."""

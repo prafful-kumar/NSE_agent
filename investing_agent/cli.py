@@ -11,6 +11,7 @@ Run 'python -m investing_agent.cli --help' for all commands.
 """
 
 import asyncio
+import re
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -1282,6 +1283,174 @@ async def _review_interpretation(
         click.echo(f"  risk observation created : {resulting_risk_observation_id}")
     if resulting_thesis_change_id:
         click.echo(f"  thesis change created    : {resulting_thesis_change_id}")
+
+
+_QUARTER_RE = re.compile(r"^(Q[1-4])FY(\d{2,4})$", re.IGNORECASE)
+
+
+def _parse_quarter_arg(quarter: str) -> tuple[int, str]:
+    """Parses e.g. 'Q2FY26' -> (2026, 'Q2'). Raises ValueError on bad format."""
+    match = _QUARTER_RE.match(quarter)
+    if not match:
+        raise ValueError(f"Invalid --quarter format: {quarter!r} (expected e.g. Q2FY26)")
+    quarter_label = match.group(1).upper()
+    fy_raw = match.group(2)
+    fiscal_year = int(fy_raw) if len(fy_raw) == 4 else 2000 + int(fy_raw)
+    return fiscal_year, quarter_label
+
+
+@cli.command("generate-estimate")
+@click.argument("symbol")
+@click.option("--quarter", required=True, help="Target quarter, e.g. Q2FY26")
+@click.option(
+    "--cutoff-at", default=None,
+    type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]),
+    help="Point-in-time cutoff for the feature snapshot (defaults to now)",
+)
+@click.option("--model-version", default="deterministic-v1")
+@click.option(
+    "--use-llm/--no-llm", default=True,
+    help="Add an LLM narrator for qualitative assumptions (requires ANTHROPIC_API_KEY, "
+    "never influences any numeric field); --no-llm runs the deterministic estimator only",
+)
+def generate_estimate_cmd(
+    symbol: str, quarter: str, cutoff_at: datetime | None, model_version: str, use_llm: bool
+) -> None:
+    """Generate an earnings estimate for SYMBOL's target QUARTER (e.g. Q2FY26).
+
+    Every numeric field (revenue/EBITDA-margin/PAT/EPS low/base/high,
+    confidence) is computed deterministically from historical financials,
+    order book, guidance, and segment/operational data. The optional LLM
+    narrator only ever adds qualitative assumption text — see
+    services/estimation/narrator.py for why it structurally cannot touch a
+    number.
+    """
+    try:
+        fiscal_year, quarter_label = _parse_quarter_arg(quarter)
+    except ValueError as exc:
+        click.echo(f"  {exc}", err=True)
+        sys.exit(1)
+    asyncio.run(_generate_estimate(symbol, fiscal_year, quarter_label, cutoff_at, model_version, use_llm))
+
+
+async def _generate_estimate(
+    symbol: str,
+    fiscal_year: int,
+    quarter_label: str,
+    cutoff_at: datetime | None,
+    model_version: str,
+    use_llm: bool,
+) -> None:
+    from investing_agent.db.repositories.financial import FinancialPeriodRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.estimation.service import EstimationService
+    from investing_agent.services.normalization import quarter_label_to_period_end
+
+    settings = get_settings()
+    narrator = None
+    if use_llm:
+        if settings.anthropic_api_key:
+            from investing_agent.services.estimation.narrator import ClaudeEstimateNarrator
+
+            narrator = ClaudeEstimateNarrator()
+        else:
+            click.echo(
+                "  Note: ANTHROPIC_API_KEY not set — running deterministic estimator only.",
+            )
+
+    resolved_cutoff = cutoff_at.replace(tzinfo=UTC) if cutoff_at else datetime.now(UTC)
+    period_end = quarter_label_to_period_end(fiscal_year, quarter_label)
+    label = f"{quarter_label}FY{str(fiscal_year)[2:]}"
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        period = await FinancialPeriodRepository(session).get_or_create(
+            company.id, "quarter", fiscal_year, quarter_label, period_end, label
+        )
+        service = EstimationService(session, narrator=narrator)
+        try:
+            run = await service.generate_estimate(
+                company_id=company.id,
+                financial_period_id=period.id,
+                cutoff_at=resolved_cutoff,
+                model_version=model_version,
+            )
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    click.echo(f"\nEstimate {run.id} for {symbol} {label} (model {run.model_version})")
+    click.echo(f"  Revenue        : {run.revenue_low} / {run.revenue_base} / {run.revenue_high}")
+    click.echo(
+        f"  EBITDA margin %: {run.ebitda_margin_low} / {run.ebitda_margin_base} / "
+        f"{run.ebitda_margin_high}"
+    )
+    click.echo(f"  PAT            : {run.pat_low} / {run.pat_base} / {run.pat_high}")
+    click.echo(f"  EPS            : {run.eps_low} / {run.eps_base} / {run.eps_high}")
+    click.echo(f"  Confidence     : {run.confidence}")
+
+
+@cli.command("list-estimates")
+@click.argument("symbol")
+def list_estimates_cmd(symbol: str) -> None:
+    """List EstimateRun history for SYMBOL, most recent first."""
+    asyncio.run(_list_estimates(symbol))
+
+
+async def _list_estimates(symbol: str) -> None:
+    from investing_agent.db.repositories.estimation import EstimateRunRepository
+    from investing_agent.db.repositories.financial import FinancialPeriodRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        rows = await EstimateRunRepository(session).list_by_company(company.id)
+        period_repo = FinancialPeriodRepository(session)
+
+        click.echo(f"\nEstimate runs for {symbol} — {len(rows)}")
+        for row in rows:
+            period = await period_repo.get(row.financial_period_id)
+            label = period.label if period else str(row.financial_period_id)
+            click.echo(
+                f"  {row.id}  {label}  [{row.model_version}]  "
+                f"rev={row.revenue_base} pat={row.pat_base} eps={row.eps_base} "
+                f"conf={row.confidence}"
+            )
+
+
+@cli.command("show-estimate")
+@click.argument("estimate_id")
+def show_estimate_cmd(estimate_id: str) -> None:
+    """Show full detail for one EstimateRun, including assumptions."""
+    asyncio.run(_show_estimate(estimate_id))
+
+
+async def _show_estimate(estimate_id: str) -> None:
+    from investing_agent.db.repositories.estimation import EstimateRunRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        run = await EstimateRunRepository(session).get(uuid.UUID(estimate_id))
+        if run is None:
+            click.echo(f"  No EstimateRun found for id {estimate_id}", err=True)
+            sys.exit(1)
+
+    click.echo(f"\nEstimateRun {run.id}")
+    click.echo(f"  Model version  : {run.model_version}")
+    click.echo(f"  Cutoff at      : {run.cutoff_at}")
+    click.echo(f"  Revenue        : {run.revenue_low} / {run.revenue_base} / {run.revenue_high}")
+    click.echo(
+        f"  EBITDA margin %: {run.ebitda_margin_low} / {run.ebitda_margin_base} / "
+        f"{run.ebitda_margin_high}"
+    )
+    click.echo(f"  PAT            : {run.pat_low} / {run.pat_base} / {run.pat_high}")
+    click.echo(f"  EPS            : {run.eps_low} / {run.eps_base} / {run.eps_high}")
+    click.echo(f"  Confidence     : {run.confidence}")
+    click.echo("  Assumptions:")
+    for a in run.assumptions:
+        click.echo(f"    [{a['source']}] {a['text']}")
 
 
 def main() -> None:
