@@ -295,3 +295,59 @@ Given the above, `services/sources/nse_source.py`'s `FilingSource` was implement
 - **No structured facts are created automatically.** This pipeline only gets bytes into `source_documents` plus a deterministic PDF text cache — a human still transcribes `OrderBookSnapshot`/`ManagementGuidance`/etc. via the `record-*` CLI commands, citing the `source_document_id` this pipeline produces.
 
 New CLI command: `sync-filings SYMBOL`, wired into `sync-company-data`/`sync-portfolio-companies` alongside `sync-corporate-actions`/`sync-financial-results`.
+
+## 12. Phase 4 — free news RSS bake-off (2026-08-18)
+
+Phase 3 is complete (tagged `phase-3-complete`). Before building Phase 4 (current news + research memory), per explicit instruction: evaluate **free RSS sources only** for BEL/HAL — Google News, LiveMint, Economic Times, Moneycontrol (only if it works) — and stop after reporting. No article-page scraping, no paywall bypass, RSS endpoints only.
+
+Harness: `investing_agent/research/provider_evaluation/news_bakeoff.py` (standalone, not wired into the app; runs on plain Python 3 stdlib — no project dependencies needed, so it also runs directly in this sandbox, unlike the NSE bake-off which needed the user's local network access). Evidence (raw RSS XML, truncated to 200KB) written to `evidence/news_*.xml`. Run 2026-08-18, live.
+
+### 12.1 Coverage matrix
+
+| Source | Query mechanism | BEL/HAL-relevant items (24h) | Relevant items (7d) | Relevant items (30d) | Notes |
+|---|---|---|---|---|---|
+| Google News RSS | per-company search (`q=SYMBOL` / `q=Company Name`, `when:Nd`) | BEL 37/43 (86%); HAL 58/100 (58%) | BEL 87/100 (87%); HAL 91/100 (91%) | BEL 98/100 (98%); HAL 95/100 (95%) | **Hits a hard ~100-item cap per query** — both symbols saturate it at 7d and 30d, so true volume is undercounted at those windows. |
+| LiveMint `/rss/companies` | general category feed, client-side keyword filter | 0/35 | (not separately windowed; single 35-item snapshot) | same | Feed only carries ~last-day of *all* company news across every listed company — essentially never contains a specific mid/small-cap name in one snapshot. |
+| Economic Times `/markets/stocks/news` | general category feed, client-side keyword filter | 0/50 | same | same | Same problem as LiveMint — general firehose, not searchable. |
+| Economic Times `/news/defence/rssfeeds/78570480.cms` | sector-specific feed (best guess at a defence-sector ID) | — | — | — | Returns HTTP 200 but 0 items — dead/wrong feed ID. Not pursued further (out of bake-off scope to guess more IDs). |
+| Moneycontrol (`business.xml`, `results.xml`, `latestnews.xml`) | general feeds | — | — | — | **Confirmed dead**: newest item across all three feeds is ~846 days old (~April 2024) despite HTTP 200. Advertised but abandoned. Excluded per your own conditional ("only if it works reliably"). |
+
+### 12.2 Relevance / irrelevant-result rate
+
+Bare-symbol queries are **not uniformly reliable** — collision risk depends entirely on how common the ticker string is as an English word/name:
+
+- **BEL** is a clean ticker: 86-98% relevant even on a bare 3-letter symbol query, because "BEL" rarely collides with anything except "Bel Air" headlines.
+- **HAL** is a noisy ticker: only **58% relevant in the 24h window** (42% irrelevant). "HAL" collides heavily with unrelated current pop-culture/news content — sampled false positives this run: HBO's *Lanterns* and *The Diplomat* (a character named "Hal"), "Harford County" (Maryland) crime stories, "ABN AMRO... Hauck [Aufhäuser]" (substring match). The noise rate drops sharply over longer windows (7d: 9% irrelevant, 30d: 5%) simply because Google's own relevance ranking pushes real financial news higher as the result set fills up.
+- Company full-name queries ("Bharat Electronics", "Hindustan Aeronautics") reduce false positives further, though this bake-off's own relevance heuristic (whole-word symbol match OR company-name substring) itself under-counts true relevance on name queries — a production filter needs to be smarter than this harness's heuristic.
+- **Conclusion**: a real ingestion filter must query by both symbol and full company name, merge results, and cannot safely trust a bare-symbol RSS search alone for tickers that double as common words/names.
+
+### 12.3 Duplicate rate
+
+Real and significant. Within Google News' own 30-day result set alone (LiveMint/ET contributed no matches to cross-check against this run), the same underlying story routinely appears via many different publishers with reworded headlines — e.g. BEL's Q1 results miss was independently reported by BusinessLine, livemint.com, Moneycontrol, NDTV Profit and The Economic Times; HAL's Adani/BEML LCH partnership by The Hindu, The New Indian Express, TradingView, Times of India, Moneycontrol, Vertical Mag and Equitypandit.
+
+Using crude title-similarity (difflib ratio ≥ 0.5, cross-publisher only) as a lower-bound proxy: **50% of BEL's and 63% of HAL's relevant 30-day items are part of at least one cross-publisher duplicate cluster.** A production pipeline needs real event-level dedup (not just this proxy) to avoid treating the same news event as N separate `news_items` rows.
+
+### 12.4 Field quality
+
+| Field | Google News RSS | LiveMint / ET |
+|---|---|---|
+| `pubDate` | Present, well-formed RFC822, parses cleanly | Present, well-formed RFC822, parses cleanly |
+| `title` | Present, usually includes outlet name suffix (` - Outlet Name`) | Present, clean |
+| `description`/snippet | **Not a real snippet** — it's an HTML `<a>` tag re-wrapping the same title/link, no article summary text | Present, real editorial summary (1-3 sentences) |
+| `link` (canonical URL) | **Not canonical** — a `news.google.com/rss/articles/...` redirect/tracking wrapper; resolving to the real publisher URL would need one extra HTTP hop per item (not done in this bake-off) | Canonical publisher URL directly |
+| Publisher identity | `<source url="...">Name</source>` element — reliable or better | Implicit (feed is single-publisher) |
+
+### 12.5 Licensing notes (needs your decision before this is wired up for real)
+
+- **Google News RSS's own copyright block states**: *"This XML feed is made available solely for the purpose of rendering Google News results within a personal feed reader for personal, non-commercial use. Any other use of the feed is expressly prohibited."* That is a real constraint on this project's own use, not just downstream redistribution — worth revisiting explicitly when we design the actual ingestion pipeline, since this app is arguably beyond "a personal feed reader" even if used for personal, non-commercial investing research.
+- LiveMint/ET feeds carry a standard publisher copyright notice (Economic Times: "Copyright (C) 2026 Bennett Coleman and Co. Ltd") but no comparable "personal feed reader only" restriction — headline + feed-provided snippet + link is the intended/expected RSS use case for these.
+- None of this bake-off fetched full article bodies — only RSS-provided metadata (title, snippet, publisher, link, pubDate), consistent with the "do not persist full copyrighted article text" requirement.
+
+### 12.6 Recommendation: primary/fallback source order
+
+1. **Primary discovery: Google News RSS**, queried per company (symbol + full company name, merged), accepting the ~100-item/query cap and the need for a real relevance filter beyond bare-symbol matching. This is the only free source with meaningful per-company targeting.
+2. **Secondary/corroboration: LiveMint `/rss/companies` and ET `/markets/stocks/news`** — not useful for discovery (near-zero single-snapshot hit rate against a specific ticker) but worth continuously polling and accumulating over time; when a story happens to also appear there, use it to attach a real snippet and a clean canonical URL to a Google-News-discovered event, since Google News provides neither.
+3. **Excluded: Moneycontrol** — all three candidate feeds are dead (~2.3 years stale).
+4. Whatever the final source mix, dedup at the *event* level (not per-RSS-item) is mandatory given the 50-63% duplicate-cluster rate observed — this is a core Phase 4 design requirement, not an edge case.
+
+**Stopping here per instruction** — Phase 4's `news_items` table, ingestion pipeline, dedup/classification logic, and the relational "research memory" models (`ResearchNote`, `NewsEvent`, `ThesisChange`, `Catalyst`, `RiskObservation`, `SourceReliability`) are not yet implemented. Recommend deciding on the Google News licensing question (§12.5) before committing to it as the primary source.
