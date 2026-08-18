@@ -66,6 +66,7 @@ class SourceDocumentRepository(BaseRepository[SourceDocument]):
             published_at=data.published_at,
             data_category=data.data_category,
             confidence=data.confidence,
+            parent_document_id=data.parent_document_id,
         )
         await self.add(doc)
 

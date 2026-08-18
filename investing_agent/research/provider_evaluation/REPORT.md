@@ -271,11 +271,27 @@ I have no network access in this sandbox, so this bake-off extension is not run 
 python -m investing_agent.research.provider_evaluation.runner
 ```
 
-and report back what printed under `[NSE] announcements`, `[NSE] annual reports`, `[NSE] investor presentations`, and the PDF check line. Placeholders below, to fill in after that run:
+and report back what printed under `[NSE] announcements`, `[NSE] annual reports`, `[NSE] investor presentations`, and the PDF check line.
+
+**Bake-off results (run 2026-08-17, evidence in `evidence/*.json` and `phase3b_bakeoff.txt`):**
 
 | Endpoint | Live-tested | Rows returned (BEL) | `document_url` present? | `check_pdf_downloadable` result |
 |---|---|---|---|---|
-| `api/corporate-announcements` | _pending_ | _pending_ | _pending_ | _pending_ |
-| `api/corp-info?corpType=annualreport` | _pending_ | _pending_ | _pending_ | _pending_ |
+| `api/corporate-announcements` | Yes | 1025 | Yes, on every row (`attchmntFile`) | `is_pdf=True size=7,094,345 content_type='application/pdf'` — real, downloadable PDF confirmed on the first candidate URL |
+| `api/corp-info?corpType=annualreport` | Yes | 0 ("Resource not found") | N/A | N/A |
 
-**Conclusion**: _pending user run._ Do not treat this section as validated until the table above is filled in from real output.
+Of the 1025 BEL announcement rows, 3 classified as `investor_presentation` (two bare PDFs, one `.zip` bundle), and one classified as `order_contract` ("Bagging/Receiving of orders/contracts" — a category not anticipated by the original `_classify_announcement` keyword set and added to it). Same shape confirmed for HAL.
+
+**Conclusion**: `api/corporate-announcements` is real, live, and returns downloadable-PDF/ZIP-backed rows — sufficient to automate. `api/corp-info?corpType=annualreport` is confirmed dead (no working NSE annual-report endpoint); annual reports stay on the manual `archive-document` CLI path indefinitely, not a temporary gap.
+
+### 11.1 Phase 3B Part B — production wiring decision (2026-08-18)
+
+Given the above, `services/sources/nse_source.py`'s `FilingSource` was implemented for real (not left as a stub) on top of `api/corporate-announcements`, with production-safety constraints the bake-off script didn't need:
+
+- **Selective auto-archival, not blanket download.** 1025+ rows per symbol makes downloading every attachment on every sync wasteful and slow. Only `investor_presentation` and `concall_transcript` categories are auto-downloaded and archived (`FilingIngestionService._AUTO_ARCHIVE_TYPES`); every other category (including the new `order_contract`) is still discovered — title, date, category, URL are all captured — but left for the manual `archive-document` path.
+- **Resilience without anti-bot bypass.** Transient failures (network errors, HTTP 429/5xx) retry with exponential backoff (`tenacity.AsyncRetrying`, 3 attempts, 2-10s backoff); an HTTP 403 is treated as a hard access block (`SourceAccessError`) and is never retried, since retrying a block is itself a bypass attempt. No cookie/session bootstrap, no browser automation, no header spoofing beyond a plain descriptive User-Agent.
+- **ZIP attachments handled safely.** `services/extraction/zip_archive.py` inspects ZIP attachments (NSE occasionally bundles an investor presentation as a ZIP, confirmed in the bake-off evidence) with zip-bomb guards (member count, per-member/total uncompressed size, compression-ratio caps) and a CRC integrity check before anything is read; member paths are never trusted for storage (zip-slip immune by construction — the returned filename is a sanitized basename only, storage paths are always re-derived from content hash). Extracted PDF/HTML members are archived as their own `SourceDocument` rows, linked back to the parent ZIP via a new `parent_document_id` column (migration 005).
+- **Idempotency and point-in-time integrity are unchanged from Phase 3A**: the existing `(company_id, source_url, content_hash)` unique constraint on `source_documents` makes re-syncing a no-op for unchanged bytes; `published_at`/`available_at`/`ingested_at` provenance fields are populated the same way as every other Phase 3A/3B source.
+- **No structured facts are created automatically.** This pipeline only gets bytes into `source_documents` plus a deterministic PDF text cache — a human still transcribes `OrderBookSnapshot`/`ManagementGuidance`/etc. via the `record-*` CLI commands, citing the `source_document_id` this pipeline produces.
+
+New CLI command: `sync-filings SYMBOL`, wired into `sync-company-data`/`sync-portfolio-companies` alongside `sync-corporate-actions`/`sync-financial-results`.

@@ -264,16 +264,62 @@ async def _sync_financial_results(symbol: str) -> None:
         )
 
 
+@cli.command("sync-filings")
+@click.argument("symbol")
+def sync_filings(symbol: str) -> None:
+    """Discover NSE announcements for SYMBOL and auto-archive investor
+    presentations / concall transcripts (PDF or ZIP).
+
+    \b
+    Pipeline:
+        NSE discover (all announcements, cheap) -> classify -> auto-archive
+        allowlisted categories only -> hash -> archive -> deterministic PDF
+        text cache. Everything else (annual reports, general announcements)
+        stays a manual archive-document job — see cli.py module docstring.
+    """
+    asyncio.run(_sync_filings(symbol))
+
+
+async def _sync_filings(symbol: str) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.filings import FilingIngestionService
+
+    async with AsyncSessionLocal() as session:
+        service = FilingIngestionService(session)
+        try:
+            result = await service.sync(symbol)
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+        finally:
+            await service.aclose()
+
+    click.echo(f"\nFilings sync — {result.symbol}")
+    click.echo(f"  Announcements discovered : {result.announcements_discovered}")
+    click.echo(f"  Documents archived       : {result.documents_archived}")
+    click.echo(f"  Already archived (idempotent skip): {result.documents_already_archived}")
+    click.echo(f"  ZIP children archived    : {result.zip_children_archived}")
+    click.echo(f"  Download failures        : {result.download_failures}")
+    if result.blocked:
+        click.echo("  WARNING: source signaled an access block (403) — sync stopped early")
+    for row in result.archived_documents[:10]:
+        click.echo(f"    {row.id}  [{row.filing_type:20s}]  {row.title}")
+
+
 @cli.command("sync-company-data")
 @click.argument("symbol")
 def sync_company_data(symbol: str) -> None:
-    """Full company-intelligence sync for SYMBOL: corporate actions + financial results."""
+    """Full company-intelligence sync for SYMBOL: corporate actions +
+    financial results + filing discovery."""
     asyncio.run(_sync_company_data(symbol))
 
 
 async def _sync_company_data(symbol: str) -> None:
     await _sync_corporate_actions(symbol)
     await _sync_financial_results(symbol)
+    await _sync_filings(symbol)
 
 
 @cli.command("sync-portfolio-companies")
@@ -303,6 +349,7 @@ async def _sync_portfolio_companies(user_id: str | None) -> None:
         click.echo(f"\n{'=' * 60}\n{symbol}\n{'=' * 60}")
         await _sync_corporate_actions(symbol)
         await _sync_financial_results(symbol)
+        await _sync_filings(symbol)
 
 
 # ── Phase 3B: primary-source document archival + structured entry ───────────
@@ -317,7 +364,7 @@ async def _sync_portfolio_companies(user_id: str | None) -> None:
 
 _FILING_TYPES = [
     "quarterly_result", "annual_report", "investor_presentation",
-    "announcement", "concall_transcript", "other",
+    "announcement", "concall_transcript", "order_contract", "other",
 ]
 _DOCUMENT_TYPE_BY_EXTENSION = {
     ".pdf": "pdf", ".html": "html", ".htm": "html", ".xml": "xml",

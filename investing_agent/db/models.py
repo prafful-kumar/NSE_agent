@@ -576,9 +576,9 @@ class SourceDocument(TimestampMixin, ProvenanceMixin, Base):
     symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     exchange: Mapped[str] = mapped_column(String(10), nullable=False)  # NSE|BSE|IR
     # quarterly_result|annual_report|investor_presentation|announcement|
-    # concall_transcript|other
+    # concall_transcript|order_contract|other
     filing_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
-    document_type: Mapped[str] = mapped_column(String(20), nullable=False)  # pdf|html|xml|xbrl|json
+    document_type: Mapped[str] = mapped_column(String(20), nullable=False)  # pdf|html|xml|xbrl|json|zip
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     period_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True
@@ -588,6 +588,11 @@ class SourceDocument(TimestampMixin, ProvenanceMixin, Base):
     mime_type: Mapped[str | None] = mapped_column(String(100))
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Set only for a document extracted from a parent ZIP archive — links a
+    # child PDF/HTML back to the ZIP SourceDocument it was extracted from.
+    parent_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True
+    )
 
     company: Mapped["Company"] = relationship(back_populates="source_documents")
     versions: Mapped[list["DocumentVersion"]] = relationship(back_populates="source_document")

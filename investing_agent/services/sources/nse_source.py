@@ -28,6 +28,17 @@ investing_agent/research/provider_evaluation/REPORT.md for the full writeup):
   from this adapter; it must come from a real filing document.
 - This adapter self-rate-limits (1.5s between requests) and is intended for
   low-volume company-level discovery, not bulk scraping.
+
+Phase 3B addendum (2026-08-18): FilingSource IS now implemented, backed by
+the same announcements JSON feed the bake-off confirmed live for BEL/HAL
+(1025 rows for BEL, real `attchmntFile` PDF/ZIP links, verified downloadable
+— see REPORT.md §11). Resilience: transient failures (network errors,
+429/5xx) are retried with exponential backoff via tenacity; an HTTP 403
+(Akamai Bot Manager block) is NEVER retried — it's raised as
+SourceAccessError so callers can degrade gracefully instead of hammering a
+block. No anti-bot bypass (no cookie/session bootstrap, no browser
+automation, no header spoofing beyond a plain descriptive User-Agent) is
+attempted anywhere in this module.
 """
 
 import asyncio
@@ -37,13 +48,19 @@ from typing import Any
 
 import httpx
 import structlog
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from investing_agent.services.sources.interfaces import (
     CorporateActionSource,
     DiscoveredDocument,
+    DownloadedAttachment,
+    FilingSource,
     FinancialResultSource,
+    RawAnnouncement,
     RawCorporateAction,
     RawFinancialResult,
+    SourceAccessError,
+    SourceTransientError,
 )
 
 log = structlog.get_logger(__name__)
@@ -54,30 +71,65 @@ _MIN_REQUEST_GAP_SECONDS = 1.5
 # unresolved rather than guessed.
 _RES_TYPE_AUDITED = {"A": True, "U": False}
 
+_ANNOUNCEMENTS_URL = (
+    "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={symbol}"
+)
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+# Module-level so tests can monkeypatch these to near-zero and keep retry
+# tests fast — read fresh on every call via AsyncRetrying, not baked into a
+# decorator at import time.
+_RETRY_ATTEMPTS = 3
+_RETRY_WAIT_MIN_SECONDS = 2.0
+_RETRY_WAIT_MAX_SECONDS = 10.0
 
-class NSEDataSource(CorporateActionSource, FinancialResultSource):
-    """FilingSource is deliberately NOT implemented: no NSE document-listing
-    endpoint was verified working in the bake-off (the corporate-filings
-    page is a JS-rendered SPA). Implementing it would mean fabricating an
-    untested scraper — out of scope per "report unresolved issues instead
-    of guessing." Revisit once a real filing-URL discovery path is verified.
-    """
 
-    def __init__(self) -> None:
-        self._client = httpx.AsyncClient(headers=_HEADERS, timeout=15.0)
+class NSEDataSource(CorporateActionSource, FinancialResultSource, FilingSource):
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        self._client = client or httpx.AsyncClient(headers=_HEADERS, timeout=15.0)
         self._last_request_at: float = 0.0
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _get(self, url: str) -> tuple[int, bytes]:
+    async def _get_with_headers(self, url: str) -> tuple[int, bytes, httpx.Headers]:
         elapsed = asyncio.get_event_loop().time() - self._last_request_at
         if elapsed < _MIN_REQUEST_GAP_SECONDS:
             await asyncio.sleep(_MIN_REQUEST_GAP_SECONDS - elapsed)
-        resp = await self._client.get(url)
+        try:
+            resp = await self._client.get(url)
+        except httpx.TransportError as exc:
+            self._last_request_at = asyncio.get_event_loop().time()
+            raise SourceTransientError(f"network error fetching {url}: {exc}") from exc
         self._last_request_at = asyncio.get_event_loop().time()
         log.info("nse_source.request", url=url, status=resp.status_code)
-        return resp.status_code, resp.content
+        return resp.status_code, resp.content, resp.headers
+
+    async def _get(self, url: str) -> tuple[int, bytes]:
+        status, body, _ = await self._get_with_headers(url)
+        return status, body
+
+    async def _get_resilient(self, url: str) -> tuple[int, bytes, httpx.Headers]:
+        """Like _get_with_headers, but retries transient failures
+        (SourceTransientError) with exponential backoff, and raises
+        SourceAccessError immediately (no retry) on HTTP 403."""
+        async for attempt in AsyncRetrying(
+            retry=retry_if_exception_type(SourceTransientError),
+            stop=stop_after_attempt(_RETRY_ATTEMPTS),
+            wait=wait_exponential(
+                multiplier=1, min=_RETRY_WAIT_MIN_SECONDS, max=_RETRY_WAIT_MAX_SECONDS
+            ),
+            reraise=True,
+        ):
+            with attempt:
+                status, body, headers = await self._get_with_headers(url)
+                if status == 403:
+                    raise SourceAccessError(
+                        f"NSE returned 403 for {url} (likely anti-bot block) — not retrying"
+                    )
+                if status in _RETRYABLE_STATUSES:
+                    raise SourceTransientError(f"NSE returned {status} for {url}")
+                return status, body, headers
+        raise AssertionError("unreachable — AsyncRetrying always returns or raises")
 
     async def get_dividends(
         self, symbol: str
@@ -199,3 +251,109 @@ class NSEDataSource(CorporateActionSource, FinancialResultSource):
         self, symbol: str
     ) -> tuple[list[RawFinancialResult], DiscoveredDocument | None]:
         return [], None  # not exercised — see class docstring
+
+    # ── FilingSource (Phase 3B) ──────────────────────────────────────────────
+
+    async def get_announcements(self, symbol: str) -> list[RawAnnouncement]:
+        """Raises SourceAccessError (403/blocked) or SourceTransientError
+        (retries exhausted) — the caller (FilingIngestionService) decides
+        how to degrade; this method never swallows those two."""
+        url = _ANNOUNCEMENTS_URL.format(symbol=symbol)
+        status, body, _ = await self._get_resilient(url)
+        if status != 200 or not body:
+            log.warning("nse_source.announcements_empty", symbol=symbol, status=status)
+            return []
+        try:
+            rows: list[dict[str, Any]] = json.loads(body)
+        except json.JSONDecodeError:
+            # A 200 with a non-JSON body (HTML challenge/error page) is
+            # reported as "no data", never guessed around.
+            log.warning("nse_source.announcements_malformed", symbol=symbol, url=url)
+            return []
+
+        out: list[RawAnnouncement] = []
+        for row in rows:
+            desc = row.get("desc") or row.get("subject")
+            filing_date = row.get("an_dt") or row.get("sort_date")
+            out.append(
+                RawAnnouncement(
+                    provider="NSE",
+                    symbol=symbol,
+                    filing_type=_classify_announcement(desc),
+                    title=desc or "(untitled)",
+                    filing_date=filing_date,
+                    published_at=_parse_nse_announcement_datetime(filing_date),
+                    document_url=row.get("attchmntFile"),
+                    source_url=url,
+                    raw=row,
+                )
+            )
+        return out
+
+    async def get_filings(self, symbol: str) -> list[RawAnnouncement]:
+        return await self.get_announcements(symbol)
+
+    async def get_annual_reports(self, symbol: str) -> list[RawAnnouncement]:
+        """No working NSE annual-report endpoint exists: `api/corp-info?
+        corpType=annualreport` returned "Resource not found" for BEL in the
+        2026-08-18 bake-off (see REPORT.md §11). Returns [] without making a
+        network call — an explicit, documented unresolved gap, not a guess.
+        Annual reports must still be archived via the `archive-document` CLI
+        command until a working discovery path is found."""
+        log.info("nse_source.annual_reports_unresolved", symbol=symbol)
+        return []
+
+    async def get_investor_presentations(self, symbol: str) -> list[RawAnnouncement]:
+        return [
+            a for a in await self.get_announcements(symbol)
+            if a.filing_type == "investor_presentation"
+        ]
+
+    async def download_attachment(self, document_url: str) -> DownloadedAttachment | None:
+        status, body, headers = await self._get_resilient(document_url)
+        if status != 200 or not body:
+            return None
+        is_pdf = body[:4] == b"%PDF"
+        is_zip = body[:4] == b"PK\x03\x04"
+        return DownloadedAttachment(
+            content=body,
+            content_type=headers.get("content-type"),
+            is_pdf=is_pdf,
+            is_zip=is_zip,
+        )
+
+
+def _classify_announcement(text: str | None) -> str:
+    """Best-effort categorization from the announcement description/subject
+    text — deterministic keyword rules only, never an LLM/guess. Order
+    matters: more specific categories are checked before the generic
+    "announcement" fallback."""
+    t = (text or "").lower()
+    if "investor presentation" in t or "investor  presentation" in t:
+        return "investor_presentation"
+    if "annual report" in t:
+        return "annual_report"
+    if "transcript" in t or "con call" in t or "concall" in t or "earnings call" in t:
+        return "concall_transcript"
+    if (
+        "financial result" in t or "quarterly result" in t
+        or "un-audited" in t or "unaudited" in t or "audited financial" in t
+    ):
+        return "quarterly_result"
+    if "order" in t and ("contract" in t or "bagging" in t or "receiving" in t):
+        return "order_contract"
+    return "announcement"
+
+
+def _parse_nse_announcement_datetime(value: str | None) -> datetime | None:
+    """NSE's announcement feed mixes two date formats across an_dt/sort_date
+    ("13-Aug-2026 17:48:45" and "2026-08-13 17:48:45"). Returns None (never
+    guesses) if neither format parses."""
+    if not value:
+        return None
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None

@@ -21,9 +21,10 @@ FilingType = Literal[
     "investor_presentation",
     "announcement",
     "concall_transcript",
+    "order_contract",
     "other",
 ]
-DocumentType = Literal["pdf", "html", "xml", "xbrl", "json", "txt"]
+DocumentType = Literal["pdf", "html", "xml", "xbrl", "json", "txt", "zip"]
 
 
 class SourceDocumentCreate(BaseSchema):
@@ -43,6 +44,7 @@ class SourceDocumentCreate(BaseSchema):
     published_at: datetime | None = None
     data_category: str = "fact"
     confidence: float | None = None
+    parent_document_id: uuid.UUID | None = None
 
 
 class SourceDocumentRead(TimestampedSchema):
@@ -65,6 +67,7 @@ class SourceDocumentRead(TimestampedSchema):
     available_at: datetime
     ingested_at: datetime
     data_category: str
+    parent_document_id: uuid.UUID | None = None
 
 
 class DocumentVersionRead(TimestampedSchema):

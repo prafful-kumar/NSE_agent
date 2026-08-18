@@ -23,6 +23,7 @@ _EXTENSION_BY_DOCUMENT_TYPE = {
     "xbrl": "xbrl",
     "json": "json",
     "txt": "txt",
+    "zip": "zip",
 }
 
 

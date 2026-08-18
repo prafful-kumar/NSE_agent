@@ -61,5 +61,6 @@ async def archive_document(
         source_url=doc.source_url,
         published_at=doc.published_at,
         data_category="fact",
+        parent_document_id=doc.parent_document_id,
     )
     return await repo.get_or_create(create)
