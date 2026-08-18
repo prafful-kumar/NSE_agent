@@ -49,6 +49,13 @@ def configure_logging(log_level: str = "INFO", json_output: bool = False) -> Non
     for lib in ("httpx", "httpcore", "asyncio", "urllib3"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
+    # SQLAlchemy's engine logger emits one line per SQL statement at INFO —
+    # the engine itself is created with echo unset so it never attaches its
+    # own handler (which would bypass structlog formatting); verbosity here
+    # is the only knob. WARNING by default, INFO (full SQL) in debug mode.
+    sqlalchemy_level = logging.INFO if log_level.upper() == "DEBUG" else logging.WARNING
+    logging.getLogger("sqlalchemy.engine").setLevel(sqlalchemy_level)
+
 
 def get_logger(name: str) -> structlog.BoundLogger:
     return structlog.get_logger(name)
