@@ -55,6 +55,59 @@ class SourceMixin:
     )
 
 
+class ProvenanceMixin:
+    """Full provenance trail for Phase 3+ research data (filings, financials,
+    corporate actions, company events).
+
+    available_at is distinct from published_at: published_at is when the
+    source (NSE/BSE/company) says the information became public; available_at
+    is when it became queryable in *our* system. Backtests must filter on
+    available_at, never published_at, to avoid look-ahead bias — a filing
+    published at 4pm might not be ingested until the next morning's batch run.
+    """
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    data_category: Mapped[str] = mapped_column(String(20), nullable=False, default="fact")
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+
+
+class VerificationMixin:
+    """Document-verification trail for normalized facts (CorporateAction,
+    FinancialResult).
+
+    data_category (from ProvenanceMixin) says what KIND of claim this is
+    (FACT vs ESTIMATE vs OPINION). verification_status says whether WE have
+    confirmed it against an archived source document. A row can be
+    data_category="fact" (it purports to be an objective figure) while
+    verification_status="unverified" (we only have it from an undocumented
+    JSON hint, not yet reconciled against the filing PDF/XBRL) — the two are
+    deliberately decoupled. Ingestion must never flip verification_status to
+    "verified" just because an API returned a value; only a successful
+    reconciliation against source_documents does that.
+    """
+
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True
+    )
+    verification_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unverified", index=True
+    )
+    verification_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id")
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # manual|structured_xbrl|parser|cross_source
+    verification_method: Mapped[str | None] = mapped_column(String(30))
+    verification_notes: Mapped[str | None] = mapped_column(Text)
+
+
 # ── Companies ──────────────────────────────────────────────────────────────────
 
 class Company(TimestampMixin, Base):
@@ -75,16 +128,24 @@ class Company(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB)
 
+    # ── Exchange / filing identity (Phase 3) ────────────────────────────────────
+    nse_symbol: Mapped[str | None] = mapped_column(String(30), index=True)
+    bse_code: Mapped[str | None] = mapped_column(String(20), index=True)  # numeric scrip code
+    cin: Mapped[str | None] = mapped_column(String(30))  # Corporate Identification Number
+    website: Mapped[str | None] = mapped_column(Text)
+    filing_identifiers: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    identifiers_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     # Relationships
     holdings: Mapped[list["Holding"]] = relationship(back_populates="company")
     watchlist_items: Mapped[list["WatchlistItem"]] = relationship(back_populates="company")
     investment_theses: Mapped[list["InvestmentThesis"]] = relationship(
         back_populates="company"
     )
-    corporate_events: Mapped[list["CorporateEvent"]] = relationship(back_populates="company")
-    financial_quarters: Mapped[list["FinancialQuarter"]] = relationship(
-        back_populates="company"
-    )
+    corporate_actions: Mapped[list["CorporateAction"]] = relationship(back_populates="company")
+    company_events: Mapped[list["CompanyEvent"]] = relationship(back_populates="company")
+    financial_periods: Mapped[list["FinancialPeriod"]] = relationship(back_populates="company")
+    source_documents: Mapped[list["SourceDocument"]] = relationship(back_populates="company")
 
     def __repr__(self) -> str:
         return f"<Company {self.symbol}>"
@@ -224,55 +285,23 @@ class InvestmentThesis(TimestampMixin, Base):
     company: Mapped["Company | None"] = relationship(back_populates="investment_theses")
 
 
-# ── Corporate actions / Events calendar ──────────────────────────────────────
+# ── Corporate actions (dividend/bonus/split/buyback/AGM/result date) ─────────
 
-class CorporateEvent(TimestampMixin, SourceMixin, Base):
-    """Corporate actions sourced from NSE/BSE/company filings.
+class CorporateAction(TimestampMixin, ProvenanceMixin, VerificationMixin, Base):
+    """Corporate actions sourced from NSE/BSE exchange filings — Tier-1 FACT
+    once verification_status="verified" (see VerificationMixin).
 
-    Primary source required for dividend dates; never infer payment dates.
+    Never infer payment_date; only store when the exchange/company publishes it.
+    Versioned: a revised dividend amount or postponed AGM creates a new version
+    row with is_latest=True and the prior row's is_latest flipped to False —
+    old values are never overwritten or deleted (audit requirement).
+
+    board_meeting_date and actual_result_published_at are deliberately
+    separate columns, never conflated: a board meeting can be announced,
+    held, and only publish results hours (or days) later.
     """
 
-    __tablename__ = "corporate_events"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    company_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
-    )
-    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
-    # Tier-1 event types: dividend|ex_dividend|record_date|payment_date|
-    # result_date|agm|bonus|split|buyback|rights|other
-    event_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
-    announced_date: Mapped[date | None] = mapped_column(Date)
-    event_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
-    ex_date: Mapped[date | None] = mapped_column(Date, index=True)
-    record_date: Mapped[date | None] = mapped_column(Date)
-    # Payment date is NOT inferred; only stored when published
-    payment_date: Mapped[date | None] = mapped_column(Date)
-    amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
-    amount_currency: Mapped[str | None] = mapped_column(String(10))
-    ratio: Mapped[str | None] = mapped_column(String(50))  # e.g. "1:2" for bonus
-    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    source_url: Mapped[str | None] = mapped_column(Text)
-    is_confirmed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-
-    company: Mapped["Company | None"] = relationship(back_populates="corporate_events")
-
-    __table_args__ = (
-        UniqueConstraint(
-            "symbol", "event_type", "event_date", "source",
-            name="uq_event_symbol_type_date_src",
-        ),
-    )
-
-
-# ── Financial quarters ────────────────────────────────────────────────────────
-
-class FinancialQuarter(TimestampMixin, SourceMixin, Base):
-    """Actual reported quarterly financial results."""
-
-    __tablename__ = "financial_quarters"
+    __tablename__ = "corporate_actions"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -281,34 +310,288 @@ class FinancialQuarter(TimestampMixin, SourceMixin, Base):
         UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
     )
     symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
-    fiscal_year: Mapped[int] = mapped_column(Integer, nullable=False)  # e.g. 2025
-    quarter: Mapped[str] = mapped_column(String(5), nullable=False)  # Q1|Q2|Q3|Q4
-    period_end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    # dividend|bonus|split|buyback|rights|agm|board_meeting|other
+    action_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    announced_date: Mapped[date | None] = mapped_column(Date)
+    event_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    ex_date: Mapped[date | None] = mapped_column(Date, index=True)
+    record_date: Mapped[date | None] = mapped_column(Date)
+    # Payment date is NOT inferred; only stored when published
+    payment_date: Mapped[date | None] = mapped_column(Date)
+    agm_date: Mapped[date | None] = mapped_column(Date)
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    amount_currency: Mapped[str | None] = mapped_column(String(10))
+    ratio: Mapped[str | None] = mapped_column(String(50))  # e.g. "1:2" for bonus
+    dividend_type: Mapped[str | None] = mapped_column(String(20))  # final|interim|special
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    is_confirmed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # ── Board meeting / result calendar (kept distinct on purpose) ─────────────
+    board_meeting_announced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    board_meeting_date: Mapped[date | None] = mapped_column(Date)
+    expected_result_date: Mapped[date | None] = mapped_column(Date)
+    actual_result_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # ── Cross-verification between NSE and BSE ──────────────────────────────────
+    cross_checked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    cross_check_source: Mapped[str | None] = mapped_column(String(50))
+    cross_check_mismatch: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    # ── Versioning (amendments / corrections) ────────────────────────────────────
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    is_latest: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("corporate_actions.id")
+    )
+
+    company: Mapped["Company"] = relationship(back_populates="corporate_actions")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id", "action_type", "event_date", "source_type", "version",
+            name="uq_corpaction_company_type_date_src_ver",
+        ),
+    )
+
+
+# ── Generic qualitative company events (non-financial timeline) ──────────────
+
+class CompanyEvent(TimestampMixin, ProvenanceMixin, Base):
+    """Qualitative timeline events that don't fit the strict corporate-action
+    schema: management changes, credit rating actions, litigation, regulatory
+    orders, order wins, capacity expansion, scheduled concalls, etc.
+    """
+
+    __tablename__ = "company_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    event_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    company: Mapped["Company"] = relationship(back_populates="company_events")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id", "event_type", "event_date", "content_hash",
+            name="uq_company_event_dedup",
+        ),
+    )
+
+
+# ── Financial periods (dimension: which quarter/year a result belongs to) ────
+
+class FinancialPeriod(TimestampMixin, Base):
+    """Defines a reporting period. Purely a dimension table — no financial
+    values live here (see FinancialResult), so it never needs versioning.
+    """
+
+    __tablename__ = "financial_periods"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    period_type: Mapped[str] = mapped_column(String(10), nullable=False)  # quarter|annual
+    fiscal_year: Mapped[int] = mapped_column(Integer, nullable=False)  # e.g. 2025 = FY25
+    quarter: Mapped[str | None] = mapped_column(String(5))  # Q1|Q2|Q3|Q4, None for annual
+    period_start: Mapped[date | None] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    label: Mapped[str] = mapped_column(String(20), nullable=False)  # e.g. "Q2FY25"
+
+    company: Mapped["Company"] = relationship(back_populates="financial_periods")
+    results: Mapped[list["FinancialResult"]] = relationship(back_populates="period")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id", "period_type", "fiscal_year", "quarter",
+            name="uq_finperiod_company_type_fy_q",
+        ),
+    )
+
+
+# ── Financial results (fact table: the actual reported numbers) ─────────────
+
+class FinancialResult(TimestampMixin, ProvenanceMixin, VerificationMixin, Base):
+    """Reported financial results for a period. Prefer XBRL/structured data
+    over PDF-derived values whenever both are available (tracked via
+    extraction_method in other_metrics).
+
+    statement_scope/reporting_basis are explicit, never inferred from a
+    provider's field naming: NSE's `re_con_pro_loss` field name implies
+    "consolidated" but was empirically found (BEL Q3 FY24-25) to hold the
+    STANDALONE PAT — see tests/unit/test_financial_normalization.py for the
+    regression test. UNRESOLVED is a legitimate value when the source
+    document doesn't make the scope determinable; normalization must never
+    guess to fill it in.
+
+    Versioned: restated/revised results (common after audit finalisation)
+    create a new row with is_latest=True; the previous row's is_latest flips
+    to False. Nothing is ever overwritten — this is required for point-in-time
+    correct backtesting (a backtest run "as of" a date must see the numbers
+    that were actually available then, not a later restatement).
+    """
+
+    __tablename__ = "financial_results"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    period_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True, nullable=False
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    # STANDALONE|CONSOLIDATED|UNRESOLVED — never guessed from field names
+    statement_scope: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="UNRESOLVED"
+    )
+    # QUARTER|YTD|ANNUAL
+    reporting_basis: Mapped[str] = mapped_column(String(10), nullable=False, default="QUARTER")
+    is_audited: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     result_date: Mapped[date | None] = mapped_column(Date)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="INR")
+    # LAKH|CRORE|ACTUAL|UNRESOLVED — never guessed
+    unit_scale: Mapped[str] = mapped_column(String(10), nullable=False, default="UNRESOLVED")
 
     # Revenue / Topline
     revenue: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
-    # EBITDA
+    # EBITDA — only populated when explicitly disclosed or deterministically
+    # derivable from disclosed line items; ebitda_source records which.
     ebitda: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     ebitda_margin_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
-    # PAT
+    ebitda_source: Mapped[str | None] = mapped_column(String(10))  # reported|derived
+    # PBT / PAT
+    pbt: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     pat: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     pat_margin_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
     # EPS
     eps_basic: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     eps_diluted: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
-    # Balance sheet items
+    # Balance sheet
     total_debt: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     cash_equivalents: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
-    # Other
+    # Cash flow
+    operating_cash_flow: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    # Returns
+    roe_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    roce_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    # Other / extraction_method: "xbrl" | "structured_api" | "pdf_manual" | "mock"
     other_metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    source_url: Mapped[str | None] = mapped_column(Text)
-    is_audited: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    company: Mapped["Company"] = relationship(back_populates="financial_quarters")
+    # ── Versioning (restatements) ────────────────────────────────────────────
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    is_latest: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_results.id")
+    )
+
+    period: Mapped["FinancialPeriod"] = relationship(back_populates="results")
 
     __table_args__ = (
-        UniqueConstraint("company_id", "fiscal_year", "quarter", name="uq_fq_company_fy_q"),
+        UniqueConstraint(
+            "period_id", "statement_scope", "reporting_basis", "source_type", "version",
+            name="uq_finresult_period_scope_basis_src_ver",
+        ),
+    )
+
+
+# ── Source documents (raw archive; never overwritten) ────────────────────────
+
+class SourceDocument(TimestampMixin, ProvenanceMixin, Base):
+    """Raw downloaded/discovered document, stored byte-for-byte unchanged —
+    the Tier-1 ground truth. Every distinct (company, source_url,
+    content_hash) combination is one row; re-ingesting the same URL with
+    unchanged bytes is a no-op (idempotent), not a new row. Normalization
+    into CorporateAction/FinancialResult happens only after the row exists
+    here — see VerificationMixin.source_document_id.
+
+    Amendment/correction chains are NOT tracked on this table (no
+    amends_document_id here) — that lives exclusively in DocumentVersion, so
+    there's one place to look for "what version was this" rather than two.
+    """
+
+    __tablename__ = "source_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    exchange: Mapped[str] = mapped_column(String(10), nullable=False)  # NSE|BSE|IR
+    # quarterly_result|annual_report|investor_presentation|announcement|
+    # concall_transcript|other
+    filing_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    document_type: Mapped[str] = mapped_column(String(20), nullable=False)  # pdf|html|xml|xbrl|json
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    period_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # sha256
+    storage_path: Mapped[str | None] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(String(100))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    company: Mapped["Company"] = relationship(back_populates="source_documents")
+    versions: Mapped[list["DocumentVersion"]] = relationship(back_populates="source_document")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id", "source_url", "content_hash",
+            name="uq_sourcedoc_company_url_hash",
+        ),
+    )
+
+
+# ── Document versions (explicit amendment/correction chain) ─────────────────
+
+class DocumentVersion(TimestampMixin, Base):
+    """Explicit version chain for a source_document. Created once (version 1,
+    status="original") for every new SourceDocument; a later amendment
+    creates a *new* SourceDocument row plus a new DocumentVersion row
+    (version 2+), and the prior version's superseded_by_id is set to point
+    forward — the full correction history is always reconstructable without
+    ever deleting or overwriting a row.
+    """
+
+    __tablename__ = "document_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True, nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # original|amended|corrected|withdrawn
+    effective_from: Mapped[date | None] = mapped_column(Date)
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document_versions.id")
+    )
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    source_document: Mapped["SourceDocument"] = relationship(back_populates="versions")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_document_id", "version_number", name="uq_docversion_srcdoc_num"
+        ),
     )
 
 

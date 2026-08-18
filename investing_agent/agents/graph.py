@@ -14,6 +14,9 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 
 from investing_agent.agents.nodes.decision import decision_node
+from investing_agent.agents.nodes.factual_company_context import (
+    factual_company_context_node,
+)
 from investing_agent.agents.nodes.memory import memory_node
 from investing_agent.agents.nodes.portfolio import portfolio_node
 from investing_agent.agents.nodes.router import route_after_router, router_node
@@ -25,10 +28,6 @@ log = get_logger(__name__)
 
 def _stub_events_node(state: InvestmentState) -> dict[str, Any]:
     return {"corporate_events": []}
-
-
-def _stub_facts_node(state: InvestmentState) -> dict[str, Any]:
-    return {}
 
 
 def build_graph(session_factory: Any = None) -> Any:
@@ -66,7 +65,17 @@ def build_graph(session_factory: Any = None) -> Any:
 
     workflow.add_node("memory", _memory)
     workflow.add_node("events", _stub_events_node)
-    workflow.add_node("facts", _stub_facts_node)
+
+    # factual_company_context reads verified financials/corporate actions
+    # from PostgreSQL only — it never calls NSE/BSE directly.
+    async def _facts(state: InvestmentState) -> dict[str, Any]:
+        if session_factory is None:
+            log.warning("facts_node.no_session_factory")
+            return {}
+        async with session_factory() as session:
+            return await factual_company_context_node(state, session=session)
+
+    workflow.add_node("facts", _facts)
     workflow.add_node("decision", decision_node)
 
     # ── Entry point ───────────────────────────────────────────────────────────

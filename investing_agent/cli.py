@@ -176,6 +176,134 @@ async def _portfolio_status(user_id: str | None) -> None:
     click.echo(f"Unrealised  : ₹{float(snapshot.total_pnl):,.2f}")
 
 
+@cli.command("sync-corporate-actions")
+@click.argument("symbol")
+def sync_corporate_actions(symbol: str) -> None:
+    """Sync dividends/bonus/split/buyback/board-meetings for SYMBOL from NSE
+    (+ BSE cross-check).
+
+    \b
+    Pipeline:
+        NSE/BSE discover -> archive -> normalize -> cross-check verify -> persist
+    """
+    asyncio.run(_sync_corporate_actions(symbol))
+
+
+async def _sync_corporate_actions(symbol: str) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.corporate_actions import (
+        CorporateActionIngestionService,
+    )
+
+    async with AsyncSessionLocal() as session:
+        service = CorporateActionIngestionService(session)
+        try:
+            result = await service.sync(symbol)
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+        finally:
+            await service.aclose()
+
+    click.echo(f"\nCorporate actions sync — {result.symbol}")
+    click.echo(f"  Documents archived : {result.documents_archived}")
+    click.echo(f"  New/revised rows   : {result.new_versions}")
+    click.echo(f"  Unchanged (idempotent skip): {result.unchanged}")
+    click.echo(f"  Skipped (unparseable)      : {result.skipped_unparseable}")
+    click.echo(f"  Cross-source verified      : {result.verified_count}")
+    for row in sorted(result.rows, key=lambda r: r.event_date, reverse=True)[:10]:
+        click.echo(
+            f"    {row.action_type:10s} event={row.event_date} ex={row.ex_date} "
+            f"amt={row.amount} status={row.verification_status}"
+        )
+
+
+@cli.command("sync-financial-results")
+@click.argument("symbol")
+def sync_financial_results(symbol: str) -> None:
+    """Sync quarterly financial results for SYMBOL from NSE.
+
+    \b
+    Pipeline:
+        NSE discover -> archive -> normalize -> persist (versioned)
+    """
+    asyncio.run(_sync_financial_results(symbol))
+
+
+async def _sync_financial_results(symbol: str) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.financial_results import (
+        FinancialResultIngestionService,
+    )
+
+    async with AsyncSessionLocal() as session:
+        service = FinancialResultIngestionService(session)
+        try:
+            result = await service.sync(symbol)
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+        finally:
+            await service.aclose()
+
+    click.echo(f"\nFinancial results sync — {result.symbol}")
+    click.echo(f"  Documents archived : {result.documents_archived}")
+    click.echo(f"  New/revised rows   : {result.new_versions}")
+    click.echo(f"  Unchanged (idempotent skip): {result.unchanged}")
+    click.echo(f"  Skipped (unparseable)      : {result.skipped_unparseable}")
+    for row in sorted(result.rows, key=lambda r: r.result_date or "", reverse=True)[:8]:
+        click.echo(
+            f"    result_date={row.result_date} scope={row.statement_scope} "
+            f"basis={row.reporting_basis} revenue={row.revenue} pat={row.pat} "
+            f"status={row.verification_status}"
+        )
+
+
+@cli.command("sync-company-data")
+@click.argument("symbol")
+def sync_company_data(symbol: str) -> None:
+    """Full company-intelligence sync for SYMBOL: corporate actions + financial results."""
+    asyncio.run(_sync_company_data(symbol))
+
+
+async def _sync_company_data(symbol: str) -> None:
+    await _sync_corporate_actions(symbol)
+    await _sync_financial_results(symbol)
+
+
+@cli.command("sync-portfolio-companies")
+@click.option("--user-id", default=None)
+def sync_portfolio_companies(user_id: str | None) -> None:
+    """Run sync-company-data for every symbol currently in the portfolio."""
+    asyncio.run(_sync_portfolio_companies(user_id))
+
+
+async def _sync_portfolio_companies(user_id: str | None) -> None:
+    settings = get_settings()
+    uid = user_id or settings.default_user_id
+
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.db.repositories.portfolio import PortfolioRepository
+
+    async with AsyncSessionLocal() as session:
+        repo = PortfolioRepository(session)
+        symbols = await repo.get_portfolio_symbols(uid)
+
+    if not symbols:
+        click.echo(f"No portfolio holdings found for user '{uid}'. Run sync-portfolio first.")
+        return
+
+    click.echo(f"Syncing company data for {len(symbols)} portfolio symbols: {', '.join(symbols)}")
+    for symbol in symbols:
+        click.echo(f"\n{'=' * 60}\n{symbol}\n{'=' * 60}")
+        await _sync_corporate_actions(symbol)
+        await _sync_financial_results(symbol)
+
+
 def main() -> None:
     cli()
 

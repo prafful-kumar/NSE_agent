@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+"""factual_company_context node: serve verified company facts from PostgreSQL.
+
+Architecture (Phase 3A):
+    NSE/BSE ──[sync-corporate-actions / sync-financial-results CLI]──► PostgreSQL
+                                                                             │
+                                                     factual_company_context_node reads here
+                                                                             │
+                                                              LangGraph state["company_facts"]
+
+This node NEVER calls NSEDataSource/BSEDataSource directly — ingestion is a
+separate, explicitly triggered pipeline (CLI/API), exactly like
+portfolio_node never calls the broker directly. Every fact carries its
+verification_status and source_document_id so downstream nodes/UI can
+distinguish a cross-checked FACT from an unverified JSON hint rather than
+treating them as equally trustworthy.
+"""
+
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from investing_agent.agents.state import InvestmentState
+from investing_agent.config.logging import get_logger
+from investing_agent.db.repositories.company import CompanyRepository
+from investing_agent.db.repositories.corporate_action import CorporateActionRepository
+from investing_agent.db.repositories.financial import FinancialResultRepository
+
+log = get_logger(__name__)
+
+
+async def factual_company_context_node(
+    state: InvestmentState,
+    session: AsyncSession,
+) -> dict[str, Any]:
+    symbols = state.get("symbols", [])
+    company_facts = dict(state.get("company_facts", {}))
+    evidence = list(state.get("evidence", []))
+    freshness = dict(state.get("data_freshness", {}))
+
+    company_repo = CompanyRepository(session)
+    financial_repo = FinancialResultRepository(session)
+    action_repo = CorporateActionRepository(session)
+
+    latest_available_at = None
+
+    for symbol in symbols:
+        company = await company_repo.get_by_symbol(symbol)
+        if not company:
+            log.info("factual_company_context.no_company", symbol=symbol)
+            continue
+
+        financial_rows = await financial_repo.list_by_company(company.id)
+        action_rows = await action_repo.list_by_company(company.id)
+
+        financials = [_financial_to_dict(r) for r in financial_rows]
+        corporate_actions = [_action_to_dict(r) for r in action_rows]
+
+        company_facts.setdefault(symbol, {})
+        company_facts[symbol]["financials"] = financials
+        company_facts[symbol]["corporate_actions"] = corporate_actions
+
+        for row in financial_rows:
+            evidence.append(_financial_evidence(symbol, row))
+            if latest_available_at is None or row.available_at > latest_available_at:
+                latest_available_at = row.available_at
+        for row in action_rows:
+            evidence.append(_action_evidence(symbol, row))
+            if latest_available_at is None or row.available_at > latest_available_at:
+                latest_available_at = row.available_at
+
+        log.info(
+            "factual_company_context.served_from_db",
+            symbol=symbol,
+            financials_count=len(financials),
+            corporate_actions_count=len(corporate_actions),
+        )
+
+    if latest_available_at is not None:
+        freshness["fundamentals"] = latest_available_at.isoformat()
+
+    return {
+        "company_facts": company_facts,
+        "evidence": evidence,
+        "data_freshness": freshness,
+    }
+
+
+def _financial_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "period_id": str(row.period_id),
+        "statement_scope": row.statement_scope,
+        "reporting_basis": row.reporting_basis,
+        "result_date": row.result_date.isoformat() if row.result_date else None,
+        "revenue": float(row.revenue) if row.revenue is not None else None,
+        "pbt": float(row.pbt) if row.pbt is not None else None,
+        "pat": float(row.pat) if row.pat is not None else None,
+        "eps_basic": float(row.eps_basic) if row.eps_basic is not None else None,
+        "unit_scale": row.unit_scale,
+        "currency": row.currency,
+        "is_audited": row.is_audited,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id) if row.source_document_id else None,
+        "source_type": row.source_type,
+    }
+
+
+def _action_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "action_type": row.action_type,
+        "event_date": row.event_date.isoformat(),
+        "ex_date": row.ex_date.isoformat() if row.ex_date else None,
+        "record_date": row.record_date.isoformat() if row.record_date else None,
+        "payment_date": row.payment_date.isoformat() if row.payment_date else None,
+        "amount": float(row.amount) if row.amount is not None else None,
+        "dividend_type": row.dividend_type,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id) if row.source_document_id else None,
+        "source_type": row.source_type,
+    }
+
+
+def _financial_evidence(symbol: str, row: Any) -> dict[str, Any]:
+    return {
+        "source": row.source_type,
+        "published_at": row.published_at.isoformat() if row.published_at else None,
+        "url": row.source_url,
+        "tier": 1,
+        "category": row.data_category,
+        "excerpt": (
+            f"{symbol} {row.statement_scope} {row.reporting_basis} result "
+            f"(result_date={row.result_date}): revenue={row.revenue}, pat={row.pat}"
+        ),
+        "is_confirmed": row.verification_status == "verified",
+    }
+
+
+def _action_evidence(symbol: str, row: Any) -> dict[str, Any]:
+    return {
+        "source": row.source_type,
+        "published_at": row.published_at.isoformat() if row.published_at else None,
+        "url": row.source_url,
+        "tier": 1,
+        "category": row.data_category,
+        "excerpt": f"{symbol} {row.action_type}: ex_date={row.ex_date}, amount={row.amount}",
+        "is_confirmed": row.verification_status == "verified",
+    }

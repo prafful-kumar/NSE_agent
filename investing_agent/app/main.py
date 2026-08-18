@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from investing_agent.app.api import agent, company, portfolio, watchlist
+from investing_agent.app.api import agent, calendar, company, portfolio, watchlist
 from investing_agent.config.logging import configure_logging
 from investing_agent.config.settings import get_settings
 
@@ -45,6 +45,7 @@ app.add_middleware(
 app.include_router(portfolio.router)
 app.include_router(watchlist.router)
 app.include_router(company.router)
+app.include_router(calendar.router)
 app.include_router(agent.router)
 
 
