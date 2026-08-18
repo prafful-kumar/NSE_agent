@@ -93,6 +93,19 @@ class NewsEventRepository(BaseRepository[NewsEvent]):
         )
         return list(result.scalars().all())
 
+    async def list_since(self, since: datetime) -> list[NewsEvent]:
+        """All events (any company) with activity since a timestamp — used by
+        InterpretationService when no single company is specified. Excludes
+        events with no primary_company_id (interpretation is always scoped
+        to a company)."""
+        result = await self.session.execute(
+            select(NewsEvent).where(
+                NewsEvent.primary_company_id.isnot(None),
+                NewsEvent.last_seen_at >= since,
+            )
+        )
+        return list(result.scalars().all())
+
     async def find_recent_candidate(
         self, company_id: uuid.UUID, since: datetime
     ) -> list[NewsEvent]:

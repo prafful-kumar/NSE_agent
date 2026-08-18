@@ -1226,3 +1226,73 @@ class SourceReliability(TimestampMixin, Base):
     company_relevance_rate: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ── Phase 4B: event interpretation (deterministic rules + LLM, reviewed) ─────
+
+class EventInterpretation(TimestampMixin, Base):
+    """A candidate interpretation of a NewsEvent's business impact on one
+    company — never a fact until a human reviews it.
+
+    Produced by services/interpretation: a deterministic rule layer runs
+    first for unambiguous event shapes (order win, management resignation,
+    dividend, buyback, regulatory approval, plant shutdown, rating
+    downgrade, capex announcement); anything a rule doesn't match falls
+    back to ClaudeEventInterpreter. Both paths write here, both start
+    review_status="pending" — there is no path, deterministic or LLM, that
+    writes directly to catalysts/risk_observations/thesis_changes. Even an
+    "obvious" rule match (e.g. order win -> revenue positive) still needs a
+    human to confirm materiality before it becomes a tracked Catalyst.
+
+    A NewsEvent can be interpreted differently per company (e.g. an order
+    win for BEL may be a competitive-loss risk signal for a rival bidder
+    mentioned in the same story), so company_id is part of the identity,
+    not inferred solely from NewsEvent.primary_company_id.
+
+    impact_classification is a JSONB dict keyed by dimension (revenue,
+    margins, order_book, management, regulation, capital_allocation,
+    valuation) -> {"direction": positive|negative|neutral, "magnitude":
+    low|medium|high}. candidate_catalyst/candidate_risk/
+    candidate_thesis_change are JSONB shaped like the corresponding
+    *Create schema payload — review-interpretation --accept constructs the
+    real row from whichever of these is present and sets the matching
+    resulting_*_id, exactly once.
+    """
+
+    __tablename__ = "event_interpretations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    news_event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("news_events.id"), index=True, nullable=False
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    impact_classification: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    candidate_catalyst: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    candidate_risk: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    candidate_thesis_change: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # DETERMINISTIC|LLM_ASSISTED
+    extraction_method: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="DETERMINISTIC"
+    )
+    extractor_version: Mapped[str | None] = mapped_column(String(50))
+    confidence: Mapped[Decimal] = mapped_column(Numeric(3, 2), nullable=False)
+    # pending|accepted|rejected|edited
+    review_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", index=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[str | None] = mapped_column(String(100))
+    resulting_catalyst_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("catalysts.id")
+    )
+    resulting_risk_observation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("risk_observations.id")
+    )
+    resulting_thesis_change_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("thesis_changes.id")
+    )

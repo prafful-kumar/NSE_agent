@@ -1066,6 +1066,224 @@ async def _record_news_url(
     click.echo(f"  news_event_id: {event.id}")
 
 
+@cli.command("interpret-events")
+@click.option("--company", "company_symbol", default=None, help="Limit to one company symbol")
+@click.option("--since-days", default=90, type=int, help="How far back to look for NewsEvents")
+@click.option(
+    "--use-llm/--no-llm", default=True,
+    help="Fall back to Claude for events no deterministic rule matches (requires "
+    "ANTHROPIC_API_KEY); --no-llm runs the rule layer only",
+)
+def interpret_events_cmd(company_symbol: str | None, since_days: int, use_llm: bool) -> None:
+    """Classify recent NewsEvents into candidate impact assessments —
+    deterministic rules first, LLM fallback for anything ambiguous. Always
+    writes review_status="pending"; nothing here touches catalysts,
+    risk_observations, or thesis_changes directly. Review with
+    list-interpretations / review-interpretation.
+    """
+    asyncio.run(_interpret_events(company_symbol, since_days, use_llm))
+
+
+async def _interpret_events(company_symbol: str | None, since_days: int, use_llm: bool) -> None:
+    from datetime import timedelta
+
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.interpretation.service import InterpretationService
+
+    settings = get_settings()
+    llm_interpreter = None
+    if use_llm:
+        if settings.anthropic_api_key:
+            from investing_agent.services.interpretation.llm_interpreter import (
+                ClaudeEventInterpreter,
+            )
+
+            llm_interpreter = ClaudeEventInterpreter()
+        else:
+            click.echo(
+                "  Note: ANTHROPIC_API_KEY not set — running deterministic rules only.",
+            )
+
+    since = datetime.now(UTC) - timedelta(days=since_days)
+
+    async with AsyncSessionLocal() as session:
+        company_id = None
+        if company_symbol:
+            company = await _resolve_company(session, company_symbol)
+            company_id = company.id
+
+        service = InterpretationService(session, llm_interpreter=llm_interpreter)
+        try:
+            result = await service.interpret_pending(company_id=company_id, since=since)
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    click.echo("\nEvent interpretation run")
+    click.echo(f"  Events considered         : {result.events_considered}")
+    click.echo(f"  Interpreted (deterministic): {result.interpreted_deterministic}")
+    click.echo(f"  Interpreted (LLM)         : {result.interpreted_llm}")
+    click.echo(f"  Already interpreted       : {result.skipped_already_interpreted}")
+    click.echo(f"  No interpretation produced: {result.skipped_no_interpretation}")
+
+
+@cli.command("list-interpretations")
+@click.option("--company", "company_symbol", default=None, help="Limit to one company symbol")
+@click.option(
+    "--status", "review_status", default="pending",
+    type=click.Choice(["pending", "accepted", "rejected", "edited", "all"]),
+)
+def list_interpretations_cmd(company_symbol: str | None, review_status: str) -> None:
+    """List EventInterpretation candidates awaiting (or past) review."""
+    asyncio.run(_list_interpretations(company_symbol, review_status))
+
+
+async def _list_interpretations(company_symbol: str | None, review_status: str) -> None:
+    from investing_agent.db.repositories.interpretation import EventInterpretationRepository
+    from investing_agent.db.repositories.news import NewsEventRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        interp_repo = EventInterpretationRepository(session)
+        event_repo = NewsEventRepository(session)
+
+        company_id = None
+        if company_symbol:
+            company = await _resolve_company(session, company_symbol)
+            company_id = company.id
+
+        if review_status == "pending":
+            rows = await interp_repo.list_pending(company_id=company_id)
+        elif company_id is not None:
+            rows = await interp_repo.list_by_company(company_id)
+            if review_status != "all":
+                rows = [r for r in rows if r.review_status == review_status]
+        else:
+            click.echo("  --company is required unless --status pending", err=True)
+            sys.exit(1)
+
+        click.echo(f"\nEvent interpretations ({review_status}) — {len(rows)}")
+        for row in rows:
+            event = await event_repo.get(row.news_event_id)
+            headline = event.representative_headline if event else "(event not found)"
+            dims = ", ".join(
+                f"{dim}:{v['direction']}/{v['magnitude']}"
+                for dim, v in row.impact_classification.items()
+            )
+            click.echo(
+                f"  {row.id}  [{row.extraction_method:12s} conf={row.confidence}]  {headline}"
+            )
+            click.echo(f"      {dims}")
+
+
+@cli.command("review-interpretation")
+@click.argument("interpretation_id")
+@click.option("--accept", "accept", is_flag=True)
+@click.option("--reject", "reject", is_flag=True)
+@click.option("--reviewed-by", required=True)
+def review_interpretation_cmd(interpretation_id: str, accept: bool, reject: bool, reviewed_by: str) -> None:
+    """Accept or reject an EventInterpretation candidate. --accept creates
+    the corresponding Catalyst/RiskObservation/ThesisChange row(s) from the
+    candidate payload and links them via resulting_*_id; --reject just
+    records the decision. Exactly one of --accept/--reject is required.
+    """
+    if accept == reject:
+        click.echo("  Specify exactly one of --accept or --reject", err=True)
+        sys.exit(1)
+    asyncio.run(_review_interpretation(interpretation_id, accept, reject, reviewed_by))
+
+
+async def _review_interpretation(
+    interpretation_id: str, accept: bool, reject: bool, reviewed_by: str
+) -> None:
+    from investing_agent.db.repositories.interpretation import EventInterpretationRepository
+    from investing_agent.db.repositories.research_memory import (
+        CatalystRepository,
+        RiskObservationRepository,
+        ThesisChangeRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.research_memory import (
+        CatalystCreate,
+        RiskObservationCreate,
+        ThesisChangeCreate,
+    )
+
+    async with AsyncSessionLocal() as session:
+        interp_repo = EventInterpretationRepository(session)
+        interpretation = await interp_repo.get(uuid.UUID(interpretation_id))
+        if interpretation is None:
+            click.echo(f"  No EventInterpretation found for id {interpretation_id}", err=True)
+            sys.exit(1)
+        if interpretation.review_status != "pending":
+            click.echo(
+                f"  EventInterpretation {interpretation_id} is already "
+                f"'{interpretation.review_status}' — not re-reviewing.",
+                err=True,
+            )
+            sys.exit(1)
+
+        if reject:
+            await interp_repo.mark_rejected(interpretation, reviewed_by=reviewed_by)
+            await session.commit()
+            click.echo(f"\nRejected interpretation {interpretation_id}")
+            return
+
+        resulting_catalyst_id = None
+        resulting_risk_observation_id = None
+        resulting_thesis_change_id = None
+
+        if interpretation.candidate_catalyst:
+            catalyst = await CatalystRepository(session).create(
+                CatalystCreate(
+                    company_id=interpretation.company_id,
+                    news_event_id=interpretation.news_event_id,
+                    **interpretation.candidate_catalyst,
+                )
+            )
+            resulting_catalyst_id = catalyst.id
+
+        if interpretation.candidate_risk:
+            risk = await RiskObservationRepository(session).create(
+                RiskObservationCreate(
+                    company_id=interpretation.company_id,
+                    news_event_id=interpretation.news_event_id,
+                    **interpretation.candidate_risk,
+                )
+            )
+            resulting_risk_observation_id = risk.id
+
+        if interpretation.candidate_thesis_change:
+            thesis_change = await ThesisChangeRepository(session).create(
+                ThesisChangeCreate(
+                    company_id=interpretation.company_id,
+                    evidence_news_event_id=interpretation.news_event_id,
+                    effective_at=datetime.now(UTC),
+                    **interpretation.candidate_thesis_change,
+                )
+            )
+            resulting_thesis_change_id = thesis_change.id
+
+        await interp_repo.mark_accepted(
+            interpretation,
+            reviewed_by=reviewed_by,
+            resulting_catalyst_id=resulting_catalyst_id,
+            resulting_risk_observation_id=resulting_risk_observation_id,
+            resulting_thesis_change_id=resulting_thesis_change_id,
+        )
+        await session.commit()
+
+    click.echo(f"\nAccepted interpretation {interpretation_id}")
+    if resulting_catalyst_id:
+        click.echo(f"  catalyst created         : {resulting_catalyst_id}")
+    if resulting_risk_observation_id:
+        click.echo(f"  risk observation created : {resulting_risk_observation_id}")
+    if resulting_thesis_change_id:
+        click.echo(f"  thesis change created    : {resulting_thesis_change_id}")
+
+
 def main() -> None:
     cli()
 
