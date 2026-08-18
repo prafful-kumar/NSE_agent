@@ -13,10 +13,10 @@ overwritten, satisfying "corrected filings preserve prior versions."
 """
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from investing_agent.db.models import FinancialPeriod, FinancialResult
 from investing_agent.db.repositories.base import BaseRepository
@@ -202,6 +202,20 @@ class FinancialResultRepository(BaseRepository[FinancialResult]):
             )
         )
         return list(result.scalars().all())
+
+    async def get_earliest_available_at(self, period_id: uuid.UUID) -> datetime | None:
+        """The earliest available_at across every FinancialResult row (any
+        scope/basis/version) tied to this period — i.e. the moment any actual
+        result for this quarter first entered the system. Backtesting derives
+        its historical cutoff_at from this value (minus a second), never a
+        guessed offset, so a backtest estimate is guaranteed to predate every
+        actual it's later scored against."""
+        result = await self.session.execute(
+            select(func.min(FinancialResult.available_at)).where(
+                FinancialResult.period_id == period_id
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def list_by_company_as_of(self, company_id: uuid.UUID, as_of) -> list[FinancialResult]:
         """Point-in-time view across all periods for a company: for each

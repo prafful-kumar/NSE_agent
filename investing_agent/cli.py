@@ -1453,6 +1453,142 @@ async def _show_estimate(estimate_id: str) -> None:
         click.echo(f"    [{a['source']}] {a['text']}")
 
 
+@cli.command("run-backtest")
+@click.option("--symbol", default=None, help="Restrict to a single company symbol (default: all companies)")
+@click.option("--model-version", default="deterministic-v1")
+def run_backtest_cmd(symbol: str | None, model_version: str) -> None:
+    """Re-run the estimator against every historical quarter that already
+    has a known actual result, scoring each estimate's accuracy now that the
+    real outcome is known.
+
+    Each historical estimate is generated with a cutoff_at derived from the
+    earliest available_at among that quarter's actual FinancialResult rows
+    (minus one second) — never a guessed offset — so it is structurally
+    impossible for the estimate to have seen the result it's scored against.
+    """
+    asyncio.run(_run_backtest(symbol, model_version))
+
+
+async def _run_backtest(symbol: str | None, model_version: str) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.backtesting.runner import run_backtest
+
+    async with AsyncSessionLocal() as session:
+        company_id = None
+        if symbol:
+            company = await _resolve_company(session, symbol)
+            company_id = company.id
+        try:
+            scores = await run_backtest(session, company_id=company_id, model_version=model_version)
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    click.echo(f"\nBacktest complete — {len(scores)} scores persisted (model {model_version})")
+    for s in scores:
+        click.echo(
+            f"  {s.id}  period={s.financial_period_id}  "
+            f"rev_err={s.revenue_error_pct}%  pat_err={s.pat_error_pct}%  "
+            f"eps_err={s.eps_error_pct}%  surprise={s.surprise_direction}  "
+            f"in_band(pat)={s.within_band_pat}  conf={s.confidence_bucket}"
+        )
+
+
+@cli.command("backtest-report")
+@click.option("--symbol", default=None, help="Restrict to a single company symbol")
+@click.option("--sector", default=None, help="Restrict to a single sector")
+@click.option("--model-version", default=None, help="Restrict to a single model version")
+def backtest_report_cmd(symbol: str | None, sector: str | None, model_version: str | None) -> None:
+    """Aggregate BacktestScore accuracy: MAE/MAPE per metric, EBITDA-margin
+    error, within-band hit rate, surprise-direction distribution,
+    growth-direction accuracy, confidence calibration, and breakdowns by
+    company/sector/model version."""
+    asyncio.run(_backtest_report(symbol, sector, model_version))
+
+
+def _print_summary(summary: dict) -> None:
+    click.echo(f"  Revenue MAPE      : {summary['revenue_mape_pct']}% (n={summary['revenue_mape_n']})")
+    click.echo(f"  PAT MAPE          : {summary['pat_mape_pct']}% (n={summary['pat_mape_n']})")
+    click.echo(f"  EPS MAPE          : {summary['eps_mape_pct']}% (n={summary['eps_mape_n']})")
+    click.echo(f"  EBITDA margin MAE : {summary['margin_mae_bps']} bps (n={summary['margin_mae_n']})")
+    click.echo(
+        f"  Within-band hit   : revenue={summary['revenue_within_band_pct']}% "
+        f"pat={summary['pat_within_band_pct']}% eps={summary['eps_within_band_pct']}%"
+    )
+    click.echo(
+        f"  Growth-direction accuracy: {summary['growth_direction_accuracy_pct']}% "
+        f"(n={summary['growth_direction_n']})"
+    )
+    dist = summary["surprise_direction_distribution_pct"]
+    if dist:
+        click.echo("  Surprise direction: " + " | ".join(f"{k}={v:.1f}%" for k, v in dist.items()))
+
+
+async def _backtest_report(symbol: str | None, sector: str | None, model_version: str | None) -> None:
+    from investing_agent.db.repositories.backtesting import BacktestScoreRepository
+    from investing_agent.db.repositories.company import CompanyRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.backtesting import BacktestScoreRead
+    from investing_agent.services.backtesting.report import group_and_summarize, summarize
+
+    async with AsyncSessionLocal() as session:
+        companies_by_id = {c.id: c for c in await CompanyRepository(session).list()}
+        rows = await BacktestScoreRepository(session).list_all()
+
+        if symbol:
+            company = await _resolve_company(session, symbol)
+            rows = [r for r in rows if r.company_id == company.id]
+        if model_version:
+            rows = [r for r in rows if r.model_version == model_version]
+        if sector:
+            rows = [
+                r for r in rows
+                if companies_by_id.get(r.company_id) and companies_by_id[r.company_id].sector == sector
+            ]
+
+        scores = [BacktestScoreRead.model_validate(r) for r in rows]
+
+    if not scores:
+        click.echo("\nNo backtest scores found matching filters.")
+        return
+
+    overall = summarize(scores)
+    click.echo(f"\nBacktest report — {overall['n']} scores")
+    _print_summary(overall)
+
+    click.echo("\nConfidence calibration:")
+    by_conf = group_and_summarize(scores, lambda s: s.confidence_bucket or "unknown")
+    for bucket in ("low", "medium", "high", "unknown"):
+        if bucket in by_conf:
+            b = by_conf[bucket]
+            click.echo(
+                f"  {bucket:8s} n={b['n']:<4d} pat_within_band={b['pat_within_band_pct']}%"
+            )
+
+    click.echo("\nBy company:")
+    by_company = group_and_summarize(
+        scores,
+        lambda s: companies_by_id[s.company_id].symbol if s.company_id in companies_by_id else str(s.company_id),
+    )
+    for key, b in by_company.items():
+        click.echo(f"  {key:12s} n={b['n']:<4d} pat_mape={b['pat_mape_pct']}% eps_mape={b['eps_mape_pct']}%")
+
+    click.echo("\nBy sector:")
+    by_sector = group_and_summarize(
+        scores,
+        lambda s: (companies_by_id[s.company_id].sector if s.company_id in companies_by_id else None) or "unknown",
+    )
+    for key, b in by_sector.items():
+        click.echo(f"  {key:12s} n={b['n']:<4d} pat_mape={b['pat_mape_pct']}%")
+
+    click.echo("\nBy model version:")
+    by_model = group_and_summarize(scores, lambda s: s.model_version)
+    for key, b in by_model.items():
+        click.echo(f"  {key:24s} n={b['n']:<4d} pat_mape={b['pat_mape_pct']}%")
+
+
 def main() -> None:
     cli()
 

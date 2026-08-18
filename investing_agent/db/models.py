@@ -1395,3 +1395,61 @@ class EstimateRun(TimestampMixin, Base):
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     # list[{"text": str, "source": "deterministic"|"llm"}]
     assumptions: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+
+
+# ── Phase 5B: point-in-time backtesting ──────────────────────────────────────
+
+class BacktestScore(TimestampMixin, Base):
+    """How one EstimateRun did against the actual FinancialResult for its
+    target period, once results were known.
+
+    One row per EstimateRun (unique on estimate_run_id) — a backtest never
+    overwrites a prior score, it produces a new EstimateRun (via
+    services.estimation.service.EstimationService.generate_estimate, the same
+    code path as a live estimate) and a new score alongside it. This keeps
+    the full backtest history immutable and lets the same historical quarter
+    be re-scored under a new model_version without losing the old result.
+
+    company_id/financial_period_id/cutoff_at/model_version are denormalized
+    from the referenced EstimateRun so aggregate reporting (by company,
+    sector via companies.sector, model_version) doesn't require a join for
+    every query.
+    """
+
+    __tablename__ = "backtest_scores"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    financial_period_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True, nullable=False
+    )
+    estimate_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("estimate_runs.id"), unique=True, nullable=False
+    )
+    financial_result_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_results.id"), index=True, nullable=False
+    )
+    cutoff_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    model_version: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    revenue_error_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    pat_error_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    eps_error_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    margin_error_bps: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    within_band_revenue: Mapped[bool | None] = mapped_column(Boolean)
+    within_band_pat: Mapped[bool | None] = mapped_column(Boolean)
+    within_band_eps: Mapped[bool | None] = mapped_column(Boolean)
+    # beat | inline | miss (PAT-based, +/-3% inline band)
+    surprise_direction: Mapped[str | None] = mapped_column(String(10))
+    # Did the estimate's base case correctly call growth vs decline in PAT
+    # relative to the most recent historical comparable, independent of
+    # magnitude? None when either side is exactly flat (no clear direction).
+    growth_direction_correct: Mapped[bool | None] = mapped_column(Boolean)
+    # low (<0.40) | medium (<0.70) | high (>=0.70), bucketed from
+    # EstimateRun.confidence — used for confidence-calibration reporting.
+    confidence_bucket: Mapped[str | None] = mapped_column(String(10))
