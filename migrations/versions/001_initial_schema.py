@@ -20,7 +20,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # Enable required PostgreSQL extensions
-    op.execute("CREATE EXTENSION IF NOT EXISTS pgvector")
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
     op.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"")
 
     # ── companies ─────────────────────────────────────────────────────────────
