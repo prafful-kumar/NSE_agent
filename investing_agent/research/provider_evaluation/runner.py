@@ -44,6 +44,42 @@ async def main() -> None:
             print(f"\n[BSE] corporate actions: {len(bse_actions)} rows "
                   f"(expected 0 — see bse_source.py docstring)")
 
+            # Phase 3B addendum: document discovery. These probe candidate
+            # endpoints that are NOT verified working — failure just means
+            # an empty list, printed plainly so it's obvious in the output.
+            announcements = await nse.get_announcements(symbol)
+            print(f"\n[NSE] announcements: {len(announcements)} rows")
+            for f in announcements[:5]:
+                print(f"  {f.filing_type:20s} date={f.filing_date} "
+                      f"url={f.document_url!r} title={f.title!r}")
+
+            annual_reports = await nse.get_annual_reports(symbol)
+            print(f"\n[NSE] annual reports: {len(annual_reports)} rows")
+            for f in annual_reports[:3]:
+                print(f"  date={f.filing_date} url={f.document_url!r} title={f.title!r}")
+
+            presentations = await nse.get_investor_presentations(symbol)
+            print(f"\n[NSE] investor presentations (filtered from announcements): "
+                  f"{len(presentations)} rows")
+            for f in presentations[:3]:
+                print(f"  date={f.filing_date} url={f.document_url!r} title={f.title!r}")
+
+            # If any candidate document_url turned up, check whether it
+            # actually serves PDF bytes (magic-number check only, no full
+            # binary saved as evidence).
+            candidate_urls = [
+                f.document_url
+                for f in (announcements + annual_reports)
+                if f.document_url
+            ]
+            if candidate_urls:
+                url = candidate_urls[0]
+                is_pdf, size, content_type = await nse.check_pdf_downloadable(url)
+                print(f"\n[NSE] PDF check on first candidate URL: {url!r}")
+                print(f"  is_pdf={is_pdf} size={size} content_type={content_type!r}")
+            else:
+                print("\n[NSE] PDF check: no candidate document_url found, skipped")
+
         print(f"\nEvidence written to {EVIDENCE_DIR}/")
         print(f"NSE requests made: {len(nse.evidence)}")
         print(f"BSE requests made: {len(bse.evidence)}")

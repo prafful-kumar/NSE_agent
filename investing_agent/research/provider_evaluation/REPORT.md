@@ -249,3 +249,33 @@ No other schema changes are needed; the raw-then-normalize ordering, idempotent 
 - [ ] Keep `CompanyResearchSource` interface defined and unimplemented (no `TijoriDataSource` yet)
 
 Stopping here per your instruction — no further Phase 3 implementation until you've reviewed this recommendation.
+
+---
+
+## 11. Phase 3B addendum — document discovery bake-off (2026-08-18)
+
+Phase 3A is validated (191/191 tests, tagged `phase-3a-validated`). Before building Phase 3B (investor presentations, annual reports, concall transcripts, order book/guidance/segment/operational/capacity facts), the same bake-off discipline from §1-§7 applies: don't guess at document-discovery endpoints, probe them first.
+
+This addendum extends `NSEEvaluationSource` (`nse_source.py`) and `runner.py` with four new methods, none of them live-verified as of this writing (unlike `get_corporate_actions`/`get_quarterly_results`, which §1 already confirmed working):
+
+- `get_announcements(symbol)` — probes `api/corporate-announcements?index=equities&symbol={symbol}`, the same JSON feed NSE's own announcements widget calls. If it returns real rows, each is classified into `filing_type` (`investor_presentation` / `annual_report` / `concall_transcript` / `quarterly_result` / `announcement`) by a best-effort keyword match on the description/subject text (`_classify_announcement`) — never guessed beyond what the text actually supports.
+- `get_annual_reports(symbol)` — probes `api/corp-info?symbol={symbol}&corpType=annualreport&market=equities`.
+- `get_investor_presentations(symbol)` — no distinct NSE endpoint is known for this; it just filters `get_announcements()` output for the `investor_presentation` classification.
+- `check_pdf_downloadable(document_url)` — fetches a candidate `attchmntFile` URL and checks the first 4 bytes for the `%PDF` magic number, without saving the full binary as evidence (keeps the repo small). Reports `(is_pdf, size_bytes, content_type)`.
+
+**Why this matters for Phase 3B's design**: if `document_url` values from these endpoints turn out to be real, directly downloadable PDFs, `services/sources/nse_source.py`'s `FilingSource` implementation (currently unimplemented in production) can be built directly on top of this JSON feed, same as §1's corporate-actions/quarterly-results fast path. If not — non-200 responses, HTML/challenge pages instead of JSON, or `attchmntFile` links that redirect through a JS-gated viewer instead of serving raw bytes — Phase 3B still works end-to-end via the CLI's `archive-document` command (manual archiving of an already-downloaded PDF); live NSE/BSE document discovery becomes a documented open item, not a blocker.
+
+I have no network access in this sandbox, so this bake-off extension is not run by me. Run it locally with:
+
+```
+python -m investing_agent.research.provider_evaluation.runner
+```
+
+and report back what printed under `[NSE] announcements`, `[NSE] annual reports`, `[NSE] investor presentations`, and the PDF check line. Placeholders below, to fill in after that run:
+
+| Endpoint | Live-tested | Rows returned (BEL) | `document_url` present? | `check_pdf_downloadable` result |
+|---|---|---|---|---|
+| `api/corporate-announcements` | _pending_ | _pending_ | _pending_ | _pending_ |
+| `api/corp-info?corpType=annualreport` | _pending_ | _pending_ | _pending_ | _pending_ |
+
+**Conclusion**: _pending user run._ Do not treat this section as validated until the table above is filled in from real output.

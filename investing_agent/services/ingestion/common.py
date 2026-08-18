@@ -18,6 +18,7 @@ from investing_agent.db.repositories.source_document import SourceDocumentReposi
 from investing_agent.schemas.company import CompanyCreate
 from investing_agent.schemas.source_documents import SourceDocumentCreate
 from investing_agent.services.sources.interfaces import DiscoveredDocument
+from investing_agent.services.storage import write_archive
 
 
 async def ensure_company(session: AsyncSession, symbol: str) -> Company:
@@ -43,6 +44,7 @@ async def archive_document(
         return None, False
 
     content_hash = hashlib.sha256(doc.content).hexdigest()
+    storage_path = write_archive(doc.content, doc.company_symbol, content_hash, doc.document_type)
     repo = SourceDocumentRepository(session)
     create = SourceDocumentCreate(
         company_id=company.id,
@@ -52,6 +54,7 @@ async def archive_document(
         document_type=doc.document_type,
         title=doc.title,
         content_hash=content_hash,
+        storage_path=storage_path,
         mime_type=doc.mime_type,
         size_bytes=len(doc.content),
         source_type=doc.source_type,

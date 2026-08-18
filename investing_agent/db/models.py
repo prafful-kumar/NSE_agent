@@ -108,6 +108,47 @@ class VerificationMixin:
     verification_notes: Mapped[str | None] = mapped_column(Text)
 
 
+class ExtractionMixin:
+    """Extraction/verification trail for Phase 3B primary-source facts
+    (order book, guidance, segment/operational metrics, capacity updates,
+    management commentary).
+
+    Deliberately a separate field name/vocabulary from VerificationMixin
+    (used by CorporateAction/FinancialResult), not reused — these are
+    human-entered point observations transcribed from a primary document,
+    not exchange filings reconciled across sources. Keeping the vocabulary
+    distinct means Phase 3A's cross-source verification logic
+    (services/verification.py) never has to reason about a status value it
+    wasn't designed for.
+
+    extraction_method: MANUAL|DETERMINISTIC|LLM_ASSISTED|HYBRID.
+    LLM_ASSISTED exists in the vocabulary for a future extractor but nothing
+    in Phase 3B writes it — every Phase 3B write path is MANUAL (CLI entry)
+    or DETERMINISTIC (mechanical PDF text extraction feeding a human-reviewed
+    CLI entry). See ExtractionCandidate for the staging table a future
+    LLM-assisted extractor must write to instead of directly here.
+
+    verification_status: UNVERIFIED|HUMAN_VERIFIED|DOCUMENT_VERIFIED|REJECTED.
+    Defaults to UNVERIFIED; only flips on an explicit human action (CLI
+    --verify flag), never automatically.
+    """
+
+    source_document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True, nullable=False
+    )
+    source_page: Mapped[int | None] = mapped_column(Integer)
+    source_section: Mapped[str | None] = mapped_column(String(255))
+    source_quote: Mapped[str | None] = mapped_column(Text)
+    extracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    extraction_method: Mapped[str] = mapped_column(String(20), nullable=False, default="MANUAL")
+    extractor_version: Mapped[str | None] = mapped_column(String(50))
+    verification_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="UNVERIFIED", index=True
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_by: Mapped[str | None] = mapped_column(String(100))
+
+
 # ── Companies ──────────────────────────────────────────────────────────────────
 
 class Company(TimestampMixin, Base):
@@ -692,3 +733,202 @@ class InstrumentMaster(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("tradingsymbol", "exchange", name="uq_instrument_symbol_exchange"),
     )
+
+
+# ── Phase 3B: primary-source company intelligence ────────────────────────────
+# Every table below is a human-entered point observation transcribed from an
+# archived primary document (investor presentation, annual report, concall
+# transcript), never an automated fact. No version-chain machinery
+# (is_latest/supersedes_id) — unlike CorporateAction/FinancialResult, these
+# aren't corrected exchange filings; if a real correction case shows up later,
+# versioning can be added then. See ExtractionMixin above for the shared
+# provenance/verification fields.
+
+
+class OrderBookSnapshot(TimestampMixin, ProvenanceMixin, ExtractionMixin, Base):
+    """A disclosed order-book value as of a point in time. expected_execution_period
+    is kept as free text (e.g. "over the next 3-4 years") and never parsed into
+    dates — companies rarely give a precise date, and inventing one would be a
+    fabrication."""
+
+    __tablename__ = "order_book_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    as_of_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    order_book_value: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="INR")
+    unit_scale: Mapped[str] = mapped_column(String(10), nullable=False, default="UNRESOLVED")
+    segment: Mapped[str | None] = mapped_column(String(100))
+    book_to_bill_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    expected_execution_period: Mapped[str | None] = mapped_column(String(255))
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class ManagementGuidance(TimestampMixin, ProvenanceMixin, ExtractionMixin, Base):
+    """Forward-looking guidance as stated by management. guidance_value_text
+    always retains the verbatim wording (e.g. "15-18% revenue growth");
+    guidance_low/high are only populated when the source gives an explicit
+    numeric range — never back-derived from prose."""
+
+    __tablename__ = "management_guidance"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    fiscal_year: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # revenue|margin|order_inflow|capex|other
+    guidance_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    metric_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    guidance_value_text: Mapped[str] = mapped_column(Text, nullable=False)
+    guidance_low: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    guidance_high: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    period_label: Mapped[str | None] = mapped_column(String(50))  # e.g. "FY26"
+    given_by: Mapped[str | None] = mapped_column(String(255))  # e.g. "CMD" / "CFO"
+    context: Mapped[str | None] = mapped_column(Text)
+
+
+class SegmentMetric(TimestampMixin, ProvenanceMixin, ExtractionMixin, Base):
+    """A segment-level (business-line/geography) metric disclosed alongside or
+    separately from consolidated financials. period_id links to
+    financial_periods when the disclosure ties to a specific reporting
+    period; nullable because some segment data (e.g. an investor-day slide)
+    isn't tied to a single quarter/year."""
+
+    __tablename__ = "segment_metrics"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    period_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True
+    )
+    segment_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # revenue|ebit|order_book|other
+    metric_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    value: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    unit_scale: Mapped[str] = mapped_column(String(10), nullable=False, default="UNRESOLVED")
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="INR")
+
+
+class OperationalMetric(TimestampMixin, ProvenanceMixin, ExtractionMixin, Base):
+    """Non-financial operating metrics disclosed by the company (e.g. capacity
+    utilization %, units produced, headcount). unit is free text (e.g. "%",
+    "units", "MW") — never assumed."""
+
+    __tablename__ = "operational_metrics"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    period_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True
+    )
+    metric_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    value: Mapped[Decimal] = mapped_column(Numeric(20, 4), nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(50))
+    as_of_date: Mapped[date | None] = mapped_column(Date, index=True)
+
+
+class CapacityUpdate(TimestampMixin, ProvenanceMixin, ExtractionMixin, Base):
+    """A disclosed change in manufacturing/production capacity. expected_completion
+    is free text, never parsed to a date, for the same reason as
+    OrderBookSnapshot.expected_execution_period."""
+
+    __tablename__ = "capacity_updates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    # expansion|new_facility|other
+    update_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    location: Mapped[str | None] = mapped_column(String(255))
+    capacity_before: Mapped[Decimal | None] = mapped_column(Numeric(20, 4))
+    capacity_after: Mapped[Decimal | None] = mapped_column(Numeric(20, 4))
+    unit: Mapped[str | None] = mapped_column(String(50))
+    announced_date: Mapped[date | None] = mapped_column(Date, index=True)
+    expected_completion: Mapped[str | None] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text)
+
+
+class ManagementCommentary(TimestampMixin, ProvenanceMixin, ExtractionMixin, Base):
+    """A direct quote or paraphrase from management (concall/AGM/press),
+    kept close to verbatim. quote is required — this table exists specifically
+    to carry the evidentiary text, not just a category label."""
+
+    __tablename__ = "management_commentary"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    period_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_periods.id"), index=True
+    )
+    speaker: Mapped[str | None] = mapped_column(String(255))
+    topic: Mapped[str | None] = mapped_column(String(255))
+    quote: Mapped[str] = mapped_column(Text, nullable=False)
+    context: Mapped[str | None] = mapped_column(Text)
+
+
+class ExtractionCandidate(TimestampMixin, Base):
+    """Staging table for a future LLM-assisted extractor — reserved now,
+    unused by any pipeline in Phase 3B. Nothing writes here yet.
+
+    Design intent: PDF/text -> LLM extraction -> ExtractionCandidate ->
+    human review -> verified domain record (OrderBookSnapshot/Guidance/etc).
+    LLM output must never bypass this table and directly become a verified
+    fact row — review_status starts "pending" and a human must explicitly
+    accept/reject/edit before resulting_record_id is set.
+    """
+
+    __tablename__ = "extraction_candidates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    source_document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True, nullable=False
+    )
+    candidate_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    extracted_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    extraction_method: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="LLM_ASSISTED"
+    )
+    extractor_version: Mapped[str | None] = mapped_column(String(50))
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    source_page: Mapped[int | None] = mapped_column(Integer)
+    source_quote: Mapped[str | None] = mapped_column(Text)
+    review_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", index=True
+    )  # pending|accepted|rejected|edited
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[str | None] = mapped_column(String(100))
+    resulting_record_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

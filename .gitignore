@@ -35,6 +35,7 @@ logs/
 # Data
 *.db
 *.sqlite
+/data/
 
 # Docker
 docker-compose.override.yml

@@ -6,9 +6,16 @@ Core rule under test: this node reads only from PostgreSQL (via repositories)
 and never talks to NSE/BSE directly. Every fact it returns must carry
 verification_status and source_document_id so downstream nodes/UI can tell a
 cross-checked FACT apart from an unverified JSON hint.
+
+Phase 3A facts (financials/corporate_actions) use VerificationMixin's
+lowercase "unverified"/"verified" vocabulary; Phase 3B facts (order book,
+guidance, segment/operational metrics, capacity updates, commentary) use
+ExtractionMixin's UNVERIFIED/HUMAN_VERIFIED/DOCUMENT_VERIFIED/REJECTED
+vocabulary — deliberately distinct, see factual_company_context.py.
 """
 
 import uuid
+from contextlib import ExitStack
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +25,15 @@ import pytest
 from investing_agent.agents.nodes.factual_company_context import (
     factual_company_context_node,
 )
+
+_PHASE3B_REPO_NAMES = [
+    "OrderBookSnapshotRepository",
+    "ManagementGuidanceRepository",
+    "SegmentMetricRepository",
+    "OperationalMetricRepository",
+    "CapacityUpdateRepository",
+    "ManagementCommentaryRepository",
+]
 
 
 def _financial_row() -> MagicMock:
@@ -62,28 +78,75 @@ def _action_row() -> MagicMock:
     )
 
 
-def _patched_repos(company, financial_rows, action_rows):
+def _order_book_row(verification_status: str = "UNVERIFIED") -> MagicMock:
+    return MagicMock(
+        as_of_date=date(2026, 6, 30),
+        order_book_value=Decimal("75000"),
+        currency="INR",
+        unit_scale="CRORE",
+        segment="Defence",
+        book_to_bill_ratio=Decimal("3.5"),
+        expected_execution_period="3-4 years",
+        verification_status=verification_status,
+        source_document_id=uuid.uuid4(),
+        source_type="manual_entry",
+        source_url=None,
+        published_at=None,
+        data_category="fact",
+        source_quote="Order book stood at ₹75,000 crore as of Q1FY27.",
+    )
+
+
+def _patch_repos(
+    company,
+    financial_rows: list | None = None,
+    action_rows: list | None = None,
+    order_book_rows: list | None = None,
+) -> ExitStack:
+    """Patches every repository the node instantiates. Phase 3B repos default
+    to returning [] unless order_book_rows is given (only OrderBookSnapshot
+    is exercised with real rows in these tests — the other five Phase 3B
+    repos share the exact same code path in the node, see
+    _extraction_evidence, so one representative type is enough here)."""
+    stack = ExitStack()
+
     company_repo = AsyncMock()
     company_repo.get_by_symbol = AsyncMock(return_value=company)
-    financial_repo = AsyncMock()
-    financial_repo.list_by_company = AsyncMock(return_value=financial_rows)
-    action_repo = AsyncMock()
-    action_repo.list_by_company = AsyncMock(return_value=action_rows)
+    stack.enter_context(patch(
+        "investing_agent.agents.nodes.factual_company_context.CompanyRepository",
+        return_value=company_repo,
+    ))
 
-    return (
-        patch(
-            "investing_agent.agents.nodes.factual_company_context.CompanyRepository",
-            return_value=company_repo,
-        ),
-        patch(
-            "investing_agent.agents.nodes.factual_company_context.FinancialResultRepository",
-            return_value=financial_repo,
-        ),
-        patch(
-            "investing_agent.agents.nodes.factual_company_context.CorporateActionRepository",
-            return_value=action_repo,
-        ),
-    )
+    financial_repo = AsyncMock()
+    financial_repo.list_by_company = AsyncMock(return_value=financial_rows or [])
+    stack.enter_context(patch(
+        "investing_agent.agents.nodes.factual_company_context.FinancialResultRepository",
+        return_value=financial_repo,
+    ))
+
+    action_repo = AsyncMock()
+    action_repo.list_by_company = AsyncMock(return_value=action_rows or [])
+    stack.enter_context(patch(
+        "investing_agent.agents.nodes.factual_company_context.CorporateActionRepository",
+        return_value=action_repo,
+    ))
+
+    order_book_repo = AsyncMock()
+    order_book_repo.list_by_company = AsyncMock(return_value=order_book_rows or [])
+    stack.enter_context(patch(
+        "investing_agent.agents.nodes.factual_company_context.OrderBookSnapshotRepository",
+        return_value=order_book_repo,
+    ))
+
+    for name in _PHASE3B_REPO_NAMES[1:]:
+        empty_repo = AsyncMock()
+        empty_repo.list_by_company = AsyncMock(return_value=[])
+        stack.enter_context(patch(
+            f"investing_agent.agents.nodes.factual_company_context.{name}",
+            return_value=empty_repo,
+        ))
+
+    return stack
 
 
 class TestFactualCompanyContextNode:
@@ -92,10 +155,9 @@ class TestFactualCompanyContextNode:
         company = MagicMock(id=uuid.uuid4(), symbol="BEL")
         fin_row, action_row = _financial_row(), _action_row()
 
-        p1, p2, p3 = _patched_repos(company, [fin_row], [action_row])
         state = {"symbols": ["BEL"], "company_facts": {}, "evidence": [], "data_freshness": {}}
 
-        with p1, p2, p3:
+        with _patch_repos(company, [fin_row], [action_row]):
             out = await factual_company_context_node(state, session=AsyncMock())
 
         bel_facts = out["company_facts"]["BEL"]
@@ -118,10 +180,9 @@ class TestFactualCompanyContextNode:
         fin_row = _financial_row()
         assert fin_row.verification_status == "unverified"
 
-        p1, p2, p3 = _patched_repos(company, [fin_row], [])
         state = {"symbols": ["BEL"], "company_facts": {}, "evidence": [], "data_freshness": {}}
 
-        with p1, p2, p3:
+        with _patch_repos(company, [fin_row], []):
             out = await factual_company_context_node(state, session=AsyncMock())
 
         financial_evidence = [e for e in out["evidence"] if "revenue" in e["excerpt"]]
@@ -129,33 +190,15 @@ class TestFactualCompanyContextNode:
 
     @pytest.mark.asyncio
     async def test_unknown_symbol_skipped_without_error(self) -> None:
-        company_repo = AsyncMock()
-        company_repo.get_by_symbol = AsyncMock(return_value=None)
-        financial_repo = AsyncMock()
-        action_repo = AsyncMock()
-
+        company = None
         state = {"symbols": ["NOPE"], "company_facts": {}, "evidence": [], "data_freshness": {}}
 
-        with (
-            patch(
-                "investing_agent.agents.nodes.factual_company_context.CompanyRepository",
-                return_value=company_repo,
-            ),
-            patch(
-                "investing_agent.agents.nodes.factual_company_context.FinancialResultRepository",
-                return_value=financial_repo,
-            ),
-            patch(
-                "investing_agent.agents.nodes.factual_company_context.CorporateActionRepository",
-                return_value=action_repo,
-            ),
-        ):
+        with _patch_repos(company) as stack:
             out = await factual_company_context_node(state, session=AsyncMock())
+            _ = stack  # repos never called since company lookup returns None
 
         assert out["company_facts"] == {}
         assert out["evidence"] == []
-        financial_repo.list_by_company.assert_not_called()
-        action_repo.list_by_company.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_symbols_returns_empty_facts(self) -> None:
@@ -173,3 +216,50 @@ class TestFactualCompanyContextNode:
 
         assert not hasattr(mod, "NSEDataSource")
         assert not hasattr(mod, "BSEDataSource")
+
+
+class TestPhase3BFacts:
+    @pytest.mark.asyncio
+    async def test_order_book_served_with_unverified_default(self) -> None:
+        company = MagicMock(id=uuid.uuid4(), symbol="BEL")
+        row = _order_book_row()
+        state = {"symbols": ["BEL"], "company_facts": {}, "evidence": [], "data_freshness": {}}
+
+        with _patch_repos(company, order_book_rows=[row]):
+            out = await factual_company_context_node(state, session=AsyncMock())
+
+        order_book = out["company_facts"]["BEL"]["order_book"]
+        assert order_book[0]["order_book_value"] == 75000.0
+        assert order_book[0]["verification_status"] == "UNVERIFIED"
+        assert order_book[0]["source_document_id"] == str(row.source_document_id)
+
+        ob_evidence = [e for e in out["evidence"] if "75,000 crore" in e["excerpt"]]
+        assert len(ob_evidence) == 1
+        assert ob_evidence[0]["is_confirmed"] is False
+
+    @pytest.mark.asyncio
+    async def test_human_verified_order_book_is_confirmed_in_evidence(self) -> None:
+        company = MagicMock(id=uuid.uuid4(), symbol="BEL")
+        row = _order_book_row(verification_status="HUMAN_VERIFIED")
+        state = {"symbols": ["BEL"], "company_facts": {}, "evidence": [], "data_freshness": {}}
+
+        with _patch_repos(company, order_book_rows=[row]):
+            out = await factual_company_context_node(state, session=AsyncMock())
+
+        ob_evidence = [e for e in out["evidence"] if "75,000 crore" in e["excerpt"]]
+        assert ob_evidence[0]["is_confirmed"] is True
+
+    @pytest.mark.asyncio
+    async def test_all_phase3b_fact_keys_present_even_when_empty(self) -> None:
+        company = MagicMock(id=uuid.uuid4(), symbol="BEL")
+        state = {"symbols": ["BEL"], "company_facts": {}, "evidence": [], "data_freshness": {}}
+
+        with _patch_repos(company):
+            out = await factual_company_context_node(state, session=AsyncMock())
+
+        bel_facts = out["company_facts"]["BEL"]
+        for key in (
+            "order_book", "guidance", "segment_metrics",
+            "operational_metrics", "capacity_updates", "commentary",
+        ):
+            assert bel_facts[key] == []

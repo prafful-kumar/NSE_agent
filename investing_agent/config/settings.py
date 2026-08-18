@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     # ── Default user ──────────────────────────────────────────────────────────
     default_user_id: str = "default"
 
+    # ── Document archive ──────────────────────────────────────────────────────
+    # Raw source-document bytes (PDFs, XBRL, etc.) are written here, keyed by
+    # content_hash. This is the actual Tier-1 archive backing SourceDocument
+    # rows — content_hash alone (without the bytes) is not enough to re-derive
+    # extracted text or re-verify a filing later.
+    document_archive_dir: str = "./data/archive"
+
     @property
     def is_development(self) -> bool:
         return self.app_env == "development"

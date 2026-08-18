@@ -36,6 +36,9 @@ dependencies = [
     # Data
     "pandas>=2.2.0",
 
+    # Document extraction
+    "pdfplumber>=0.11.0",
+
     # Logging
     "structlog>=24.1.0",
 

@@ -12,7 +12,8 @@ Run 'python -m investing_agent.cli --help' for all commands.
 
 import asyncio
 import sys
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 
 import click
 
@@ -302,6 +303,489 @@ async def _sync_portfolio_companies(user_id: str | None) -> None:
         click.echo(f"\n{'=' * 60}\n{symbol}\n{'=' * 60}")
         await _sync_corporate_actions(symbol)
         await _sync_financial_results(symbol)
+
+
+# ── Phase 3B: primary-source document archival + structured entry ───────────
+#
+# Manual pipeline (no automated NSE/BSE document discovery yet — see
+# research/provider_evaluation/REPORT.md §11): a human downloads a PDF,
+# archives it with archive-document, reads it with extract-text, then
+# transcribes structured facts with the record-* commands, always citing
+# --source-document-id and --page/--quote. Every record-* command defaults
+# to extraction_method=MANUAL / verification_status=UNVERIFIED; --verify
+# flips to HUMAN_VERIFIED only on explicit human action, never automatically.
+
+_FILING_TYPES = [
+    "quarterly_result", "annual_report", "investor_presentation",
+    "announcement", "concall_transcript", "other",
+]
+_DOCUMENT_TYPE_BY_EXTENSION = {
+    ".pdf": "pdf", ".html": "html", ".htm": "html", ".xml": "xml",
+    ".xbrl": "xbrl", ".json": "json", ".txt": "txt",
+}
+
+
+@cli.command("archive-document")
+@click.argument("symbol")
+@click.option("--file", "file_path", required=True, type=click.Path(exists=True, dir_okay=False),
+              help="Path to the already-downloaded document")
+@click.option("--filing-type", required=True, type=click.Choice(_FILING_TYPES))
+@click.option("--title", required=True)
+@click.option("--exchange", default="IR", type=click.Choice(["NSE", "BSE", "IR"]))
+@click.option("--source-url", default=None)
+def archive_document_cmd(
+    symbol: str, file_path: str, filing_type: str, title: str, exchange: str,
+    source_url: str | None,
+) -> None:
+    """Manually archive an already-downloaded document (PDF/HTML/XML/etc.)
+    for SYMBOL. Works regardless of whether live NSE/BSE document discovery
+    is available."""
+    asyncio.run(_archive_document(symbol, file_path, filing_type, title, exchange, source_url))
+
+
+async def _archive_document(
+    symbol: str, file_path: str, filing_type: str, title: str, exchange: str,
+    source_url: str | None,
+) -> None:
+    from pathlib import Path
+
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.common import archive_document, ensure_company
+    from investing_agent.services.sources.interfaces import DiscoveredDocument
+
+    path = Path(file_path)
+    document_type = _DOCUMENT_TYPE_BY_EXTENSION.get(path.suffix.lower(), "pdf")
+    content = path.read_bytes()
+
+    async with AsyncSessionLocal() as session:
+        company = await ensure_company(session, symbol)
+        doc = DiscoveredDocument(
+            company_symbol=company.symbol,
+            exchange=exchange,
+            source="manual",
+            source_type="manual_upload",
+            filing_type=filing_type,
+            document_type=document_type,
+            title=title,
+            content=content,
+            source_url=source_url or f"file://{path.resolve()}",
+            fetched_at=datetime.now(UTC),
+        )
+        try:
+            row, created = await archive_document(session, company, doc)
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    click.echo(f"\n{'Archived' if created else 'Already archived (idempotent)'}: {row.title}")
+    click.echo(f"  source_document_id: {row.id}")
+    click.echo(f"  storage_path      : {row.storage_path}")
+    click.echo(f"  content_hash      : {row.content_hash}")
+
+
+@cli.command("show-filings")
+@click.argument("symbol")
+@click.option("--filing-type", default=None, type=click.Choice(_FILING_TYPES))
+def show_filings_cmd(symbol: str, filing_type: str | None) -> None:
+    """List archived documents for SYMBOL — find the source_document_id to
+    cite in a record-* command."""
+    asyncio.run(_show_filings(symbol, filing_type))
+
+
+async def _show_filings(symbol: str, filing_type: str | None) -> None:
+    from investing_agent.db.repositories.company import CompanyRepository
+    from investing_agent.db.repositories.source_document import SourceDocumentRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        company = await CompanyRepository(session).get_by_symbol(symbol.upper())
+        if not company:
+            click.echo(f"No company found for symbol '{symbol}'.")
+            sys.exit(1)
+        docs = await SourceDocumentRepository(session).list_by_company(company.id)
+
+    if filing_type:
+        docs = [d for d in docs if d.filing_type == filing_type]
+
+    if not docs:
+        click.echo(f"No archived documents for {symbol}.")
+        return
+
+    click.echo(f"\nArchived documents — {symbol} ({len(docs)})")
+    for d in docs:
+        published = d.published_at.date().isoformat() if d.published_at else "?"
+        click.echo(f"  {d.id}  [{d.filing_type:20s}] {published}  {d.title}")
+
+
+@cli.command("extract-text")
+@click.argument("source_document_id")
+@click.option("--page", type=int, default=None, help="Print only this page (1-indexed)")
+def extract_text_cmd(source_document_id: str, page: int | None) -> None:
+    """Print mechanically extracted text for an archived PDF, so a human can
+    read the source before transcribing values. Cached on disk after the
+    first extraction (see services.storage.write_text_cache)."""
+    asyncio.run(_extract_text(source_document_id, page))
+
+
+async def _extract_text(source_document_id: str, page: int | None) -> None:
+    from investing_agent.db.models import SourceDocument
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.extraction.pdf_text import (
+        deserialize_pages,
+        extract_pdf_text,
+        serialize_pages,
+    )
+    from investing_agent.services.storage import read_archive, read_text_cache, write_text_cache
+
+    async with AsyncSessionLocal() as session:
+        doc = await session.get(SourceDocument, uuid.UUID(source_document_id))
+
+    if not doc:
+        click.echo(f"No source document with id {source_document_id}.", err=True)
+        sys.exit(1)
+    if not doc.storage_path:
+        click.echo("This document has no archived bytes (storage_path is empty).", err=True)
+        sys.exit(1)
+    if doc.document_type != "pdf":
+        click.echo(
+            f"Text extraction only supports pdf (document_type={doc.document_type!r}).", err=True
+        )
+        sys.exit(1)
+
+    cached = read_text_cache(doc.storage_path)
+    if cached is not None:
+        pages = deserialize_pages(cached)
+    else:
+        content = read_archive(doc.storage_path)
+        pages = extract_pdf_text(content)
+        write_text_cache(doc.storage_path, serialize_pages(pages))
+
+    selected = [p for p in pages if page is None or p.page_number == page]
+    if page is not None and not selected:
+        click.echo(f"Document has {len(pages)} page(s); page {page} does not exist.", err=True)
+        sys.exit(1)
+
+    for p in selected:
+        click.echo(f"\n{'─' * 60}\nPage {p.page_number}\n{'─' * 60}")
+        click.echo(p.text)
+
+
+def _extraction_fields(
+    source_document_id: str, page: int | None, quote: str | None,
+    verify: bool, verified_by: str | None,
+) -> dict:
+    now = datetime.now(UTC)
+    if verify and not verified_by:
+        click.echo("  ERROR: --verify requires --verified-by", err=True)
+        sys.exit(1)
+    return dict(
+        source_document_id=uuid.UUID(source_document_id),
+        source_page=page,
+        source_quote=quote,
+        extracted_at=now,
+        extraction_method="MANUAL",
+        verification_status="HUMAN_VERIFIED" if verify else "UNVERIFIED",
+        verified_at=now if verify else None,
+        verified_by=verified_by if verify else None,
+        source_type="manual_entry",
+    )
+
+
+async def _resolve_company(session, symbol: str):
+    from investing_agent.services.ingestion.common import ensure_company
+
+    return await ensure_company(session, symbol)
+
+
+@cli.command("record-order-book")
+@click.argument("symbol")
+@click.option("--source-document-id", required=True)
+@click.option("--as-of-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--value", "order_book_value", required=True, type=float)
+@click.option("--currency", default="INR")
+@click.option(
+    "--unit-scale", default="UNRESOLVED",
+    type=click.Choice(["LAKH", "CRORE", "ACTUAL", "UNRESOLVED"]),
+)
+@click.option("--segment", default=None)
+@click.option("--book-to-bill", "book_to_bill_ratio", default=None, type=float)
+@click.option("--execution-period", "expected_execution_period", default=None)
+@click.option("--notes", default=None)
+@click.option("--page", type=int, default=None)
+@click.option("--quote", default=None)
+@click.option("--verify", is_flag=True)
+@click.option("--verified-by", default=None)
+def record_order_book_cmd(symbol, source_document_id, as_of_date, order_book_value, currency,
+                           unit_scale, segment, book_to_bill_ratio, expected_execution_period,
+                           notes, page, quote, verify, verified_by) -> None:
+    """Record a disclosed order-book value for SYMBOL as of a date."""
+    asyncio.run(_record_order_book(
+        symbol, source_document_id, as_of_date.date(), order_book_value, currency,
+        unit_scale, segment, book_to_bill_ratio, expected_execution_period,
+        notes, page, quote, verify, verified_by,
+    ))
+
+
+async def _record_order_book(symbol, source_document_id, as_of_date, order_book_value, currency,
+                              unit_scale, segment, book_to_bill_ratio, expected_execution_period,
+                              notes, page, quote, verify, verified_by) -> None:
+    from investing_agent.db.repositories.company_research import OrderBookSnapshotRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.company_research import OrderBookSnapshotCreate
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        data = OrderBookSnapshotCreate(
+            company_id=company.id, symbol=company.symbol, as_of_date=as_of_date,
+            order_book_value=order_book_value, currency=currency, unit_scale=unit_scale,
+            segment=segment, book_to_bill_ratio=book_to_bill_ratio,
+            expected_execution_period=expected_execution_period, notes=notes,
+            **_extraction_fields(source_document_id, page, quote, verify, verified_by),
+        )
+        row = await OrderBookSnapshotRepository(session).create(data)
+        await session.commit()
+
+    click.echo(f"\nRecorded order book snapshot — {symbol} as of {as_of_date}")
+    click.echo(f"  id: {row.id}  verification_status={row.verification_status}")
+
+
+@cli.command("record-guidance")
+@click.argument("symbol")
+@click.option("--source-document-id", required=True)
+@click.option("--fiscal-year", required=True, type=int)
+@click.option("--guidance-type", required=True)
+@click.option("--metric-label", required=True)
+@click.option("--value-text", "guidance_value_text", required=True)
+@click.option("--low", "guidance_low", default=None, type=float)
+@click.option("--high", "guidance_high", default=None, type=float)
+@click.option("--period-label", default=None)
+@click.option("--given-by", default=None)
+@click.option("--context", default=None)
+@click.option("--page", type=int, default=None)
+@click.option("--quote", default=None)
+@click.option("--verify", is_flag=True)
+@click.option("--verified-by", default=None)
+def record_guidance_cmd(symbol, source_document_id, fiscal_year, guidance_type, metric_label,
+                         guidance_value_text, guidance_low, guidance_high, period_label,
+                         given_by, context, page, quote, verify, verified_by) -> None:
+    """Record forward-looking management guidance for SYMBOL."""
+    asyncio.run(_record_guidance(
+        symbol, source_document_id, fiscal_year, guidance_type, metric_label,
+        guidance_value_text, guidance_low, guidance_high, period_label,
+        given_by, context, page, quote, verify, verified_by,
+    ))
+
+
+async def _record_guidance(symbol, source_document_id, fiscal_year, guidance_type, metric_label,
+                            guidance_value_text, guidance_low, guidance_high, period_label,
+                            given_by, context, page, quote, verify, verified_by) -> None:
+    from investing_agent.db.repositories.company_research import ManagementGuidanceRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.company_research import ManagementGuidanceCreate
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        data = ManagementGuidanceCreate(
+            company_id=company.id, symbol=company.symbol, fiscal_year=fiscal_year,
+            guidance_type=guidance_type, metric_label=metric_label,
+            guidance_value_text=guidance_value_text, guidance_low=guidance_low,
+            guidance_high=guidance_high, period_label=period_label, given_by=given_by,
+            context=context,
+            **_extraction_fields(source_document_id, page, quote, verify, verified_by),
+        )
+        row = await ManagementGuidanceRepository(session).create(data)
+        await session.commit()
+
+    click.echo(f"\nRecorded guidance — {symbol} FY{fiscal_year} {guidance_type}")
+    click.echo(f"  id: {row.id}  verification_status={row.verification_status}")
+
+
+@cli.command("record-segment-metric")
+@click.argument("symbol")
+@click.option("--source-document-id", required=True)
+@click.option("--segment-name", required=True)
+@click.option("--metric-type", required=True)
+@click.option("--value", required=True, type=float)
+@click.option("--period-id", default=None)
+@click.option(
+    "--unit-scale", default="UNRESOLVED",
+    type=click.Choice(["LAKH", "CRORE", "ACTUAL", "UNRESOLVED"]),
+)
+@click.option("--currency", default="INR")
+@click.option("--page", type=int, default=None)
+@click.option("--quote", default=None)
+@click.option("--verify", is_flag=True)
+@click.option("--verified-by", default=None)
+def record_segment_metric_cmd(symbol, source_document_id, segment_name, metric_type, value,
+                               period_id, unit_scale, currency, page, quote, verify,
+                               verified_by) -> None:
+    """Record a segment-level (business-line/geography) metric for SYMBOL."""
+    asyncio.run(_record_segment_metric(
+        symbol, source_document_id, segment_name, metric_type, value,
+        period_id, unit_scale, currency, page, quote, verify, verified_by,
+    ))
+
+
+async def _record_segment_metric(symbol, source_document_id, segment_name, metric_type, value,
+                                  period_id, unit_scale, currency, page, quote, verify,
+                                  verified_by) -> None:
+    from investing_agent.db.repositories.company_research import SegmentMetricRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.company_research import SegmentMetricCreate
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        data = SegmentMetricCreate(
+            company_id=company.id, symbol=company.symbol,
+            period_id=uuid.UUID(period_id) if period_id else None,
+            segment_name=segment_name, metric_type=metric_type, value=value,
+            unit_scale=unit_scale, currency=currency,
+            **_extraction_fields(source_document_id, page, quote, verify, verified_by),
+        )
+        row = await SegmentMetricRepository(session).create(data)
+        await session.commit()
+
+    click.echo(f"\nRecorded segment metric — {symbol} {segment_name}/{metric_type}")
+    click.echo(f"  id: {row.id}  verification_status={row.verification_status}")
+
+
+@cli.command("record-operational-metric")
+@click.argument("symbol")
+@click.option("--source-document-id", required=True)
+@click.option("--metric-name", required=True)
+@click.option("--value", required=True, type=float)
+@click.option("--unit", default=None)
+@click.option("--as-of-date", default=None, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--period-id", default=None)
+@click.option("--page", type=int, default=None)
+@click.option("--quote", default=None)
+@click.option("--verify", is_flag=True)
+@click.option("--verified-by", default=None)
+def record_operational_metric_cmd(symbol, source_document_id, metric_name, value, unit,
+                                   as_of_date, period_id, page, quote, verify,
+                                   verified_by) -> None:
+    """Record a non-financial operating metric for SYMBOL."""
+    asyncio.run(_record_operational_metric(
+        symbol, source_document_id, metric_name, value, unit,
+        as_of_date.date() if as_of_date else None, period_id, page, quote, verify, verified_by,
+    ))
+
+
+async def _record_operational_metric(symbol, source_document_id, metric_name, value, unit,
+                                      as_of_date, period_id, page, quote, verify,
+                                      verified_by) -> None:
+    from investing_agent.db.repositories.company_research import OperationalMetricRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.company_research import OperationalMetricCreate
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        data = OperationalMetricCreate(
+            company_id=company.id, symbol=company.symbol,
+            period_id=uuid.UUID(period_id) if period_id else None,
+            metric_name=metric_name, value=value, unit=unit, as_of_date=as_of_date,
+            **_extraction_fields(source_document_id, page, quote, verify, verified_by),
+        )
+        row = await OperationalMetricRepository(session).create(data)
+        await session.commit()
+
+    click.echo(f"\nRecorded operational metric — {symbol} {metric_name}")
+    click.echo(f"  id: {row.id}  verification_status={row.verification_status}")
+
+
+@cli.command("record-capacity-update")
+@click.argument("symbol")
+@click.option("--source-document-id", required=True)
+@click.option("--update-type", required=True)
+@click.option("--location", default=None)
+@click.option("--capacity-before", default=None, type=float)
+@click.option("--capacity-after", default=None, type=float)
+@click.option("--unit", default=None)
+@click.option("--announced-date", default=None, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--expected-completion", default=None)
+@click.option("--description", default=None)
+@click.option("--page", type=int, default=None)
+@click.option("--quote", default=None)
+@click.option("--verify", is_flag=True)
+@click.option("--verified-by", default=None)
+def record_capacity_update_cmd(symbol, source_document_id, update_type, location,
+                                capacity_before, capacity_after, unit, announced_date,
+                                expected_completion, description, page, quote, verify,
+                                verified_by) -> None:
+    """Record a manufacturing/production capacity change for SYMBOL."""
+    asyncio.run(_record_capacity_update(
+        symbol, source_document_id, update_type, location, capacity_before, capacity_after,
+        unit, announced_date.date() if announced_date else None, expected_completion,
+        description, page, quote, verify, verified_by,
+    ))
+
+
+async def _record_capacity_update(symbol, source_document_id, update_type, location,
+                                   capacity_before, capacity_after, unit, announced_date,
+                                   expected_completion, description, page, quote, verify,
+                                   verified_by) -> None:
+    from investing_agent.db.repositories.company_research import CapacityUpdateRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.company_research import CapacityUpdateCreate
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        data = CapacityUpdateCreate(
+            company_id=company.id, symbol=company.symbol, update_type=update_type,
+            location=location, capacity_before=capacity_before, capacity_after=capacity_after,
+            unit=unit, announced_date=announced_date, expected_completion=expected_completion,
+            description=description,
+            **_extraction_fields(source_document_id, page, quote, verify, verified_by),
+        )
+        row = await CapacityUpdateRepository(session).create(data)
+        await session.commit()
+
+    click.echo(f"\nRecorded capacity update — {symbol} {update_type}")
+    click.echo(f"  id: {row.id}  verification_status={row.verification_status}")
+
+
+@cli.command("record-commentary")
+@click.argument("symbol")
+@click.option("--source-document-id", required=True)
+@click.option("--quote", required=True, help="The management quote itself (verbatim)")
+@click.option("--speaker", default=None)
+@click.option("--topic", default=None)
+@click.option("--context", default=None)
+@click.option("--period-id", default=None)
+@click.option("--page", type=int, default=None)
+@click.option("--verify", is_flag=True)
+@click.option("--verified-by", default=None)
+def record_commentary_cmd(symbol, source_document_id, quote, speaker, topic, context,
+                           period_id, page, verify, verified_by) -> None:
+    """Record a direct management quote/commentary for SYMBOL. The quote text
+    itself is also used as the extraction evidence (source_quote)."""
+    asyncio.run(_record_commentary(
+        symbol, source_document_id, quote, speaker, topic, context, period_id, page,
+        verify, verified_by,
+    ))
+
+
+async def _record_commentary(symbol, source_document_id, quote, speaker, topic, context,
+                              period_id, page, verify, verified_by) -> None:
+    from investing_agent.db.repositories.company_research import ManagementCommentaryRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.company_research import ManagementCommentaryCreate
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        data = ManagementCommentaryCreate(
+            company_id=company.id, symbol=company.symbol,
+            period_id=uuid.UUID(period_id) if period_id else None,
+            speaker=speaker, topic=topic, quote=quote, context=context,
+            **_extraction_fields(source_document_id, page, quote, verify, verified_by),
+        )
+        row = await ManagementCommentaryRepository(session).create(data)
+        await session.commit()
+
+    click.echo(f"\nRecorded management commentary — {symbol} ({speaker or 'unknown speaker'})")
+    click.echo(f"  id: {row.id}  verification_status={row.verification_status}")
 
 
 def main() -> None:

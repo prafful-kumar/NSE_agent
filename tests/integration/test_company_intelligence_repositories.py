@@ -22,6 +22,10 @@ from decimal import Decimal
 import pytest
 
 from investing_agent.schemas.company import CompanyCreate
+from investing_agent.schemas.company_research import (
+    ManagementGuidanceCreate,
+    OrderBookSnapshotCreate,
+)
 from investing_agent.schemas.corporate_actions import CorporateActionCreate
 from investing_agent.schemas.financials import FinancialResultCreate
 from investing_agent.schemas.source_documents import SourceDocumentCreate
@@ -53,6 +57,25 @@ async def bel(db_session):
             symbol=f"BEL-{uuid.uuid4().hex[:8]}", name="Bharat Electronics", exchange="NSE"
         )
     )
+
+
+@pytest.fixture
+async def source_doc(db_session, bel):
+    """An archived document to cite as source_document_id — every Phase 3B
+    ExtractionMixin row requires one (NOT NULL FK)."""
+    from investing_agent.db.repositories.source_document import SourceDocumentRepository
+
+    repo = SourceDocumentRepository(db_session)
+    doc, _ = await repo.get_or_create(
+        SourceDocumentCreate(
+            company_id=bel.id, symbol=bel.symbol, exchange="IR",
+            filing_type="investor_presentation", document_type="pdf",
+            title="Q1FY27 Investor Presentation", content_hash="doc1" * 16,
+            source_type="manual_upload", source_url="file:///tmp/ip.pdf",
+            data_category="fact",
+        )
+    )
+    return doc
 
 
 class TestSourceDocumentRepositoryIdempotency:
@@ -417,3 +440,154 @@ class TestCorporateActionRepositoryVersioningAndCalendar:
         latest_rows = await repo.list_by_company_as_of(bel.id, datetime(2026, 8, 1, tzinfo=UTC))
         assert len(latest_rows) == 1
         assert latest_rows[0].amount == Decimal("0.65")
+
+
+class TestOrderBookSnapshotRepository:
+    """Phase 3B: unlike Phase 3A's versioned repos above, these are plain
+    inserts (no is_latest/supersedes_id) — each row is a distinct
+    human-transcribed observation, not a correction of a prior row."""
+
+    def _snapshot(self, *, company_id, source_document_id, value: str) -> OrderBookSnapshotCreate:
+        return OrderBookSnapshotCreate(
+            company_id=company_id, symbol="BEL", as_of_date=date(2026, 6, 30),
+            order_book_value=Decimal(value), currency="INR", unit_scale="CRORE",
+            segment="Defence", expected_execution_period="3-4 years",
+            source_document_id=source_document_id, source_page=12,
+            source_quote="Order book stood at the disclosed value as of Q1FY27.",
+            source_type="manual_entry",
+        )
+
+    async def test_create_and_list_by_company(self, db_session, bel, source_doc) -> None:
+        from investing_agent.db.repositories.company_research import (
+            OrderBookSnapshotRepository,
+        )
+
+        repo = OrderBookSnapshotRepository(db_session)
+        created = await repo.create(
+            self._snapshot(company_id=bel.id, source_document_id=source_doc.id, value="75000")
+        )
+        await db_session.flush()
+
+        assert created.verification_status == "UNVERIFIED"  # never auto-verified
+        assert created.extraction_method == "MANUAL"
+        assert created.source_document_id == source_doc.id
+
+        rows = await repo.list_by_company(bel.id)
+        assert len(rows) == 1
+        assert rows[0].id == created.id
+
+    async def test_point_in_time_excludes_future_snapshot(
+        self, db_session, bel, source_doc
+    ) -> None:
+        from investing_agent.db.repositories.company_research import (
+            OrderBookSnapshotRepository,
+        )
+
+        repo = OrderBookSnapshotRepository(db_session)
+        row = await repo.create(
+            self._snapshot(company_id=bel.id, source_document_id=source_doc.id, value="75000")
+        )
+        row.available_at = datetime(2026, 7, 15, tzinfo=UTC)
+        await db_session.flush()
+
+        before = await repo.list_by_company_as_of(bel.id, datetime(2026, 7, 1, tzinfo=UTC))
+        after = await repo.list_by_company_as_of(bel.id, datetime(2026, 8, 1, tzinfo=UTC))
+
+        assert before == []
+        assert len(after) == 1
+        assert after[0].id == row.id
+
+    async def test_two_snapshots_are_independent_rows_not_versioned(
+        self, db_session, bel, source_doc
+    ) -> None:
+        """No version-chain machinery: a second snapshot for a different
+        as_of_date is just another row, not a correction of the first."""
+        from investing_agent.db.repositories.company_research import (
+            OrderBookSnapshotRepository,
+        )
+
+        repo = OrderBookSnapshotRepository(db_session)
+        await repo.create(
+            self._snapshot(company_id=bel.id, source_document_id=source_doc.id, value="75000")
+        )
+        await repo.create(
+            self._snapshot(company_id=bel.id, source_document_id=source_doc.id, value="82000")
+        )
+        await db_session.flush()
+
+        rows = await repo.list_by_company(bel.id)
+        assert len(rows) == 2
+        assert {r.order_book_value for r in rows} == {Decimal("75000"), Decimal("82000")}
+
+
+class TestManagementGuidanceRepository:
+    def _guidance(
+        self, *, company_id, source_document_id, low: str, high: str
+    ) -> ManagementGuidanceCreate:
+        return ManagementGuidanceCreate(
+            company_id=company_id, symbol="BEL", fiscal_year=2027,
+            guidance_type="revenue", metric_label="Revenue growth",
+            guidance_value_text=f"{low}-{high}% revenue growth",
+            guidance_low=Decimal(low), guidance_high=Decimal(high),
+            period_label="FY27", given_by="CMD",
+            source_document_id=source_document_id, source_page=5,
+            source_quote="We expect double-digit revenue growth in FY27.",
+            source_type="manual_entry",
+        )
+
+    async def test_create_defaults_to_manual_unverified(self, db_session, bel, source_doc) -> None:
+        from investing_agent.db.repositories.company_research import (
+            ManagementGuidanceRepository,
+        )
+
+        repo = ManagementGuidanceRepository(db_session)
+        row = await repo.create(
+            self._guidance(company_id=bel.id, source_document_id=source_doc.id, low="15", high="18")
+        )
+        await db_session.flush()
+
+        assert row.extraction_method == "MANUAL"
+        assert row.verification_status == "UNVERIFIED"
+        assert row.guidance_value_text == "15-18% revenue growth"
+
+    async def test_verify_flag_sets_human_verified(self, db_session, bel, source_doc) -> None:
+        """Mirrors the CLI's --verify path: verification_status only flips
+        on an explicit human action, never automatically at ingestion."""
+        from investing_agent.db.repositories.company_research import (
+            ManagementGuidanceRepository,
+        )
+        from investing_agent.schemas.company_research import ManagementGuidanceCreate
+
+        repo = ManagementGuidanceRepository(db_session)
+        data = ManagementGuidanceCreate(
+            company_id=bel.id, symbol="BEL", fiscal_year=2027,
+            guidance_type="revenue", metric_label="Revenue growth",
+            guidance_value_text="15-18% revenue growth",
+            source_document_id=source_doc.id, source_type="manual_entry",
+            verification_status="HUMAN_VERIFIED", verified_by="analyst@example.com",
+            verified_at=datetime(2026, 8, 18, tzinfo=UTC),
+        )
+        row = await repo.create(data)
+        await db_session.flush()
+
+        assert row.verification_status == "HUMAN_VERIFIED"
+        assert row.verified_by == "analyst@example.com"
+
+    async def test_list_by_company_as_of_point_in_time(self, db_session, bel, source_doc) -> None:
+        from investing_agent.db.repositories.company_research import (
+            ManagementGuidanceRepository,
+        )
+
+        repo = ManagementGuidanceRepository(db_session)
+        row = await repo.create(
+            self._guidance(company_id=bel.id, source_document_id=source_doc.id, low="15", high="18")
+        )
+        row.available_at = datetime(2026, 7, 15, tzinfo=UTC)
+        await db_session.flush()
+
+        before = await repo.list_by_company_as_of(bel.id, datetime(2026, 7, 1, tzinfo=UTC))
+        after = await repo.list_by_company_as_of(bel.id, datetime(2026, 8, 1, tzinfo=UTC))
+
+        assert before == []
+        assert len(after) == 1
+        assert after[0].id == row.id

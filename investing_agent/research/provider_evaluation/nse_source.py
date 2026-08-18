@@ -28,16 +28,27 @@ import httpx
 from investing_agent.research.provider_evaluation.interfaces import (
     CorporateActionSource,
     Evidence,
+    FilingSource,
     FinancialResultSource,
     RawCorporateAction,
+    RawFiling,
     RawFinancialResult,
 )
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; investing-agent-research/1.0)"}
 _MIN_REQUEST_GAP_SECONDS = 1.5  # self-imposed rate limit; be a polite citizen
 
+# Candidate categories for the corporate-announcements endpoint — NSE's
+# announcement feed is the one plausible free path to investor
+# presentations, annual reports, and concall transcripts (all typically
+# disclosed as exchange announcements, not separate document types). Not
+# verified working as of this bake-off extension — that's exactly what
+# this module exists to find out. See REPORT.md §11.
+_ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={symbol}"
+_ANNUAL_REPORTS_URL = "https://www.nseindia.com/api/corp-info?symbol={symbol}&corpType=annualreport&market=equities"
 
-class NSEEvaluationSource(CorporateActionSource, FinancialResultSource):
+
+class NSEEvaluationSource(CorporateActionSource, FinancialResultSource, FilingSource):
     def __init__(self, evidence_dir: Path | None = None) -> None:
         self._client = httpx.AsyncClient(headers=_HEADERS, timeout=15.0)
         self._evidence_dir = evidence_dir
@@ -162,3 +173,111 @@ class NSEEvaluationSource(CorporateActionSource, FinancialResultSource):
         return []  # not exercised in this bake-off; annual results live on the
         # corporate-filings-financial-results HTML page, which is JS-rendered
         # and was not scraped (see REPORT.md).
+
+    # ── Phase 3B addendum: document discovery ───────────────────────────────
+    # Unlike get_corporate_actions/get_quarterly_results (proven working in
+    # the original bake-off), these four probe *candidate* endpoints that
+    # have not been live-verified. Failure (non-200, empty body, or a body
+    # that isn't the expected JSON shape) is reported as an empty list with
+    # evidence logged, never guessed around. See REPORT.md §11.
+
+    async def get_announcements(self, symbol: str) -> list[RawFiling]:
+        import json
+
+        url = _ANNOUNCEMENTS_URL.format(symbol=symbol)
+        status, body = await self._get(url, "announcements", symbol)
+        now = datetime.now(UTC)
+        if status != 200 or not body:
+            return []
+        try:
+            rows: list[dict[str, Any]] = json.loads(body)
+        except json.JSONDecodeError:
+            return []  # got a 200 but not JSON — likely a challenge/HTML page
+        out: list[RawFiling] = []
+        for row in rows:
+            attachment = row.get("attchmntFile")
+            out.append(
+                RawFiling(
+                    provider="NSE",
+                    symbol=symbol,
+                    filing_type=_classify_announcement(row.get("desc") or row.get("subject")),
+                    title=row.get("desc") or row.get("subject") or "(untitled)",
+                    filing_date=row.get("an_dt") or row.get("sort_date"),
+                    document_url=attachment,
+                    available_at=now,
+                    source_url=url,
+                    raw=row,
+                )
+            )
+        return out
+
+    async def get_filings(self, symbol: str) -> list[RawFiling]:
+        return await self.get_announcements(symbol)
+
+    async def get_annual_reports(self, symbol: str) -> list[RawFiling]:
+        import json
+
+        url = _ANNUAL_REPORTS_URL.format(symbol=symbol)
+        status, body = await self._get(url, "annual_reports", symbol)
+        now = datetime.now(UTC)
+        if status != 200 or not body:
+            return []
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return []
+        rows: list[dict[str, Any]] = (
+            payload if isinstance(payload, list) else payload.get("data", [])
+        )
+        out: list[RawFiling] = []
+        for row in rows:
+            out.append(
+                RawFiling(
+                    provider="NSE",
+                    symbol=symbol,
+                    filing_type="annual_report",
+                    title=row.get("fromYr") and f"Annual Report {row.get('fromYr')}-{row.get('toYr')}"
+                    or "Annual Report",
+                    filing_date=row.get("toYr"),
+                    document_url=row.get("Attachment") or row.get("attachment"),
+                    available_at=now,
+                    source_url=url,
+                    raw=row,
+                )
+            )
+        return out
+
+    async def get_investor_presentations(self, symbol: str) -> list[RawFiling]:
+        """Investor presentations are not a distinct NSE endpoint — they show
+        up (if at all) as a category within the announcements feed, so this
+        just filters get_announcements(). Confirm in evidence/ whether any
+        rows actually classify as investor_presentation."""
+        return [f for f in await self.get_announcements(symbol) if f.filing_type == "investor_presentation"]
+
+    async def check_pdf_downloadable(self, document_url: str) -> tuple[bool, int | None, str | None]:
+        """Fetches the first bytes of a candidate attachment URL and checks
+        for the %PDF magic number, without saving the full binary as
+        evidence (keep the repo small). Returns (is_pdf, size_bytes,
+        content_type)."""
+        try:
+            resp = await self._client.get(document_url)
+        except httpx.HTTPError as exc:
+            return False, None, str(exc)
+        is_pdf = resp.content[:4] == b"%PDF"
+        return is_pdf, len(resp.content), resp.headers.get("content-type")
+
+
+def _classify_announcement(text: str | None) -> str:
+    """Best-effort categorization from the announcement description/subject
+    text. Never guesses "other" into something more specific than the text
+    actually supports."""
+    t = (text or "").lower()
+    if "investor presentation" in t or "investor  presentation" in t:
+        return "investor_presentation"
+    if "annual report" in t:
+        return "annual_report"
+    if "transcript" in t or "con call" in t or "concall" in t or "earnings call" in t:
+        return "concall_transcript"
+    if "financial result" in t or "quarterly result" in t:
+        return "quarterly_result"
+    return "announcement"

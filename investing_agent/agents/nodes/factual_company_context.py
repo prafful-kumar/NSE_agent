@@ -24,10 +24,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from investing_agent.agents.state import InvestmentState
 from investing_agent.config.logging import get_logger
 from investing_agent.db.repositories.company import CompanyRepository
+from investing_agent.db.repositories.company_research import (
+    CapacityUpdateRepository,
+    ManagementCommentaryRepository,
+    ManagementGuidanceRepository,
+    OperationalMetricRepository,
+    OrderBookSnapshotRepository,
+    SegmentMetricRepository,
+)
 from investing_agent.db.repositories.corporate_action import CorporateActionRepository
 from investing_agent.db.repositories.financial import FinancialResultRepository
 
 log = get_logger(__name__)
+
+# Phase 3B rows use ExtractionMixin's verification_status vocabulary
+# (UNVERIFIED|HUMAN_VERIFIED|DOCUMENT_VERIFIED|REJECTED) — deliberately
+# different from Phase 3A's VerificationMixin ("unverified"/"verified"), so
+# this set is distinct from the "verified" check used for financials/actions.
+_CONFIRMED_STATUSES = {"HUMAN_VERIFIED", "DOCUMENT_VERIFIED"}
 
 
 async def factual_company_context_node(
@@ -42,6 +56,12 @@ async def factual_company_context_node(
     company_repo = CompanyRepository(session)
     financial_repo = FinancialResultRepository(session)
     action_repo = CorporateActionRepository(session)
+    order_book_repo = OrderBookSnapshotRepository(session)
+    guidance_repo = ManagementGuidanceRepository(session)
+    segment_repo = SegmentMetricRepository(session)
+    operational_repo = OperationalMetricRepository(session)
+    capacity_repo = CapacityUpdateRepository(session)
+    commentary_repo = ManagementCommentaryRepository(session)
 
     latest_available_at = None
 
@@ -53,13 +73,28 @@ async def factual_company_context_node(
 
         financial_rows = await financial_repo.list_by_company(company.id)
         action_rows = await action_repo.list_by_company(company.id)
-
-        financials = [_financial_to_dict(r) for r in financial_rows]
-        corporate_actions = [_action_to_dict(r) for r in action_rows]
+        order_book_rows = await order_book_repo.list_by_company(company.id)
+        guidance_rows = await guidance_repo.list_by_company(company.id)
+        segment_rows = await segment_repo.list_by_company(company.id)
+        operational_rows = await operational_repo.list_by_company(company.id)
+        capacity_rows = await capacity_repo.list_by_company(company.id)
+        commentary_rows = await commentary_repo.list_by_company(company.id)
 
         company_facts.setdefault(symbol, {})
-        company_facts[symbol]["financials"] = financials
-        company_facts[symbol]["corporate_actions"] = corporate_actions
+        company_facts[symbol]["financials"] = [_financial_to_dict(r) for r in financial_rows]
+        company_facts[symbol]["corporate_actions"] = [_action_to_dict(r) for r in action_rows]
+        company_facts[symbol]["order_book"] = [_order_book_to_dict(r) for r in order_book_rows]
+        company_facts[symbol]["guidance"] = [_guidance_to_dict(r) for r in guidance_rows]
+        company_facts[symbol]["segment_metrics"] = [
+            _segment_metric_to_dict(r) for r in segment_rows
+        ]
+        company_facts[symbol]["operational_metrics"] = [
+            _operational_metric_to_dict(r) for r in operational_rows
+        ]
+        company_facts[symbol]["capacity_updates"] = [
+            _capacity_update_to_dict(r) for r in capacity_rows
+        ]
+        company_facts[symbol]["commentary"] = [_commentary_to_dict(r) for r in commentary_rows]
 
         for row in financial_rows:
             evidence.append(_financial_evidence(symbol, row))
@@ -69,12 +104,25 @@ async def factual_company_context_node(
             evidence.append(_action_evidence(symbol, row))
             if latest_available_at is None or row.available_at > latest_available_at:
                 latest_available_at = row.available_at
+        for row in (
+            order_book_rows + guidance_rows + segment_rows
+            + operational_rows + capacity_rows + commentary_rows
+        ):
+            evidence.append(_extraction_evidence(symbol, row))
+            if latest_available_at is None or row.available_at > latest_available_at:
+                latest_available_at = row.available_at
 
         log.info(
             "factual_company_context.served_from_db",
             symbol=symbol,
-            financials_count=len(financials),
-            corporate_actions_count=len(corporate_actions),
+            financials_count=len(financial_rows),
+            corporate_actions_count=len(action_rows),
+            order_book_count=len(order_book_rows),
+            guidance_count=len(guidance_rows),
+            segment_metrics_count=len(segment_rows),
+            operational_metrics_count=len(operational_rows),
+            capacity_updates_count=len(capacity_rows),
+            commentary_count=len(commentary_rows),
         )
 
     if latest_available_at is not None:
@@ -145,4 +193,100 @@ def _action_evidence(symbol: str, row: Any) -> dict[str, Any]:
         "category": row.data_category,
         "excerpt": f"{symbol} {row.action_type}: ex_date={row.ex_date}, amount={row.amount}",
         "is_confirmed": row.verification_status == "verified",
+    }
+
+
+# ── Phase 3B: primary-source facts ────────────────────────────────────────
+
+def _order_book_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "as_of_date": row.as_of_date.isoformat(),
+        "order_book_value": float(row.order_book_value),
+        "currency": row.currency,
+        "unit_scale": row.unit_scale,
+        "segment": row.segment,
+        "book_to_bill_ratio": (
+            float(row.book_to_bill_ratio) if row.book_to_bill_ratio is not None else None
+        ),
+        "expected_execution_period": row.expected_execution_period,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id),
+    }
+
+
+def _guidance_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "fiscal_year": row.fiscal_year,
+        "guidance_type": row.guidance_type,
+        "metric_label": row.metric_label,
+        "guidance_value_text": row.guidance_value_text,
+        "guidance_low": float(row.guidance_low) if row.guidance_low is not None else None,
+        "guidance_high": float(row.guidance_high) if row.guidance_high is not None else None,
+        "period_label": row.period_label,
+        "given_by": row.given_by,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id),
+    }
+
+
+def _segment_metric_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "segment_name": row.segment_name,
+        "metric_type": row.metric_type,
+        "value": float(row.value),
+        "unit_scale": row.unit_scale,
+        "currency": row.currency,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id),
+    }
+
+
+def _operational_metric_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "metric_name": row.metric_name,
+        "value": float(row.value),
+        "unit": row.unit,
+        "as_of_date": row.as_of_date.isoformat() if row.as_of_date else None,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id),
+    }
+
+
+def _capacity_update_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "update_type": row.update_type,
+        "location": row.location,
+        "capacity_before": float(row.capacity_before) if row.capacity_before is not None else None,
+        "capacity_after": float(row.capacity_after) if row.capacity_after is not None else None,
+        "unit": row.unit,
+        "announced_date": row.announced_date.isoformat() if row.announced_date else None,
+        "expected_completion": row.expected_completion,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id),
+    }
+
+
+def _commentary_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "speaker": row.speaker,
+        "topic": row.topic,
+        "quote": row.quote,
+        "verification_status": row.verification_status,
+        "source_document_id": str(row.source_document_id),
+    }
+
+
+def _extraction_evidence(symbol: str, row: Any) -> dict[str, Any]:
+    """Shared evidence builder for every Phase 3B (ExtractionMixin) fact
+    type — they all carry source_quote/source_page/verification_status in
+    the same shape, unlike the Phase 3A financial/action rows above."""
+    excerpt = row.source_quote or f"{symbol} {type(row).__name__}"
+    return {
+        "source": row.source_type,
+        "published_at": row.published_at.isoformat() if row.published_at else None,
+        "url": row.source_url,
+        "tier": 1,
+        "category": row.data_category,
+        "excerpt": excerpt,
+        "is_confirmed": row.verification_status in _CONFIRMED_STATUSES,
     }
