@@ -45,7 +45,7 @@ def _actual(**overrides) -> FinancialResultRead:
         pbt=None, pat=Decimal("90"), pat_margin_pct=None, eps_basic=None, eps_diluted=Decimal("5.0"),
         total_debt=None, cash_equivalents=None, operating_cash_flow=None, roe_pct=None, roce_pct=None,
         version=1, is_latest=True, source_type="test", source_url=None,
-        published_at=NOW, available_at=NOW, data_category="fact",
+        published_at=NOW, available_at=NOW, timestamp_precision="EXACT", data_category="fact",
         verification_status="unverified", verification_method=None, verified_at=None,
         created_at=NOW, updated_at=NOW,
     )

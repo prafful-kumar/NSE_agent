@@ -15,6 +15,7 @@ import re
 import sys
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import click
 
@@ -518,6 +519,134 @@ async def _extract_text(source_document_id: str, page: int | None) -> None:
     for p in selected:
         click.echo(f"\n{'─' * 60}\nPage {p.page_number}\n{'─' * 60}")
         click.echo(p.text)
+
+
+@cli.command("verify-financial-result")
+@click.argument("symbol")
+@click.option("--quarter", required=True, help="Target quarter, e.g. Q3FY25")
+@click.option(
+    "--scope", default="CONSOLIDATED",
+    type=click.Choice(["STANDALONE", "CONSOLIDATED", "UNRESOLVED"]),
+)
+@click.option(
+    "--basis", default="QUARTER", type=click.Choice(["QUARTER", "YTD", "ANNUAL"])
+)
+@click.option(
+    "--source-document-id", required=True,
+    help="Archived primary document (NSE filing PDF preferred, IR PDF, BSE fallback — "
+    "never a secondary financial website) — see show-filings",
+)
+@click.option("--revenue", default=None, type=Decimal, help="Revenue as reported in the document")
+@click.option("--pat", default=None, type=Decimal, help="PAT as reported in the document")
+@click.option(
+    "--eps-diluted", default=None, type=Decimal, help="Diluted EPS as reported in the document"
+)
+def verify_financial_result_cmd(
+    symbol: str,
+    quarter: str,
+    scope: str,
+    basis: str,
+    source_document_id: str,
+    revenue: Decimal | None,
+    pat: Decimal | None,
+    eps_diluted: Decimal | None,
+) -> None:
+    """Cross-check the stored FinancialResult for SYMBOL's QUARTER against
+    values read from an archived primary document, and promote
+    verification_status to "verified" (or "disputed" on a mismatch).
+
+    Reads --revenue/--pat/--eps-diluted from you (the reviewer, reading the
+    primary document's own text) — this command never re-derives them from
+    the document itself. Provide at least one.
+    """
+    if revenue is None and pat is None and eps_diluted is None:
+        click.echo(
+            "  ERROR: provide at least one of --revenue/--pat/--eps-diluted", err=True
+        )
+        sys.exit(1)
+    try:
+        fiscal_year, quarter_label = _parse_quarter_arg(quarter)
+    except ValueError as exc:
+        click.echo(f"  {exc}", err=True)
+        sys.exit(1)
+    asyncio.run(
+        _verify_financial_result(
+            symbol, fiscal_year, quarter_label, scope, basis,
+            source_document_id, revenue, pat, eps_diluted,
+        )
+    )
+
+
+async def _verify_financial_result(
+    symbol: str,
+    fiscal_year: int,
+    quarter_label: str,
+    scope: str,
+    basis: str,
+    source_document_id: str,
+    revenue: Decimal | None,
+    pat: Decimal | None,
+    eps_diluted: Decimal | None,
+) -> None:
+    from investing_agent.db.repositories.financial import (
+        FinancialPeriodRepository,
+        FinancialResultRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.normalization import quarter_label_to_period_end
+    from investing_agent.services.verification import verify_financial_result_manual
+
+    period_end = quarter_label_to_period_end(fiscal_year, quarter_label)
+    label = f"{quarter_label}FY{str(fiscal_year)[2:]}"
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        period_repo = FinancialPeriodRepository(session)
+        period = await period_repo.get_or_create(
+            company.id, "quarter", fiscal_year, quarter_label, period_end, label
+        )
+        result_repo = FinancialResultRepository(session)
+        candidates = await result_repo.list_latest_by_period(period.id, scope, basis)
+        if not candidates:
+            click.echo(
+                f"  ERROR: no {scope}/{basis} FinancialResult found for {symbol} {label}", err=True
+            )
+            sys.exit(1)
+        if len(candidates) > 1:
+            click.echo(
+                f"  ERROR: {len(candidates)} candidate rows found (multiple source_types) — "
+                "not yet supported by this command",
+                err=True,
+            )
+            sys.exit(1)
+        target = candidates[0]
+
+        try:
+            outcome = await verify_financial_result_manual(
+                session,
+                result_id=target.id,
+                source_document_id=uuid.UUID(source_document_id),
+                reported_revenue=revenue,
+                reported_pat=pat,
+                reported_eps_diluted=eps_diluted,
+            )
+            await session.commit()
+        except ValueError as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    if outcome.matched:
+        click.echo(f"\nVERIFIED — {symbol} {label} ({scope}/{basis})")
+        click.echo(f"  Checked fields: {', '.join(outcome.checked_fields)}")
+    else:
+        click.echo(f"\nDISPUTED — {symbol} {label} ({scope}/{basis})")
+        for m in outcome.mismatches:
+            click.echo(f"  {m}")
+    if outcome.timestamp_upgraded:
+        click.echo(
+            f"  Timestamp precision upgraded to EXACT (available_at={outcome.result.available_at})"
+        )
 
 
 def _extraction_fields(
@@ -1479,15 +1608,32 @@ async def _run_backtest(symbol: str | None, model_version: str) -> None:
             company = await _resolve_company(session, symbol)
             company_id = company.id
         try:
-            scores = await run_backtest(session, company_id=company_id, model_version=model_version)
+            result = await run_backtest(session, company_id=company_id, model_version=model_version)
             await session.commit()
         except Exception as exc:
             await session.rollback()
             click.echo(f"  ERROR: {exc}", err=True)
             sys.exit(1)
 
-    click.echo(f"\nBacktest complete — {len(scores)} scores persisted (model {model_version})")
-    for s in scores:
+    click.echo(
+        f"\nBacktest complete — {len(result.scores)} scores persisted (model {model_version})"
+    )
+    click.echo("\nPer-period diagnostics:")
+    for d in result.diagnostics:
+        click.echo(f"\n  {d.period_label}")
+        click.echo(f"    actual_available_at : {d.actual_available_at}")
+        click.echo(f"    actual_ingested_at  : {d.actual_ingested_at}")
+        click.echo(f"    cutoff_at           : {d.cutoff_at}")
+        click.echo(f"    verified history    : {d.verified_history_count}")
+        click.echo(f"    unverified history  : {d.unverified_history_count}")
+        click.echo(f"    estimate            : {d.estimate_status}")
+        if d.reason:
+            click.echo(f"    reason              : {d.reason}")
+
+    scored = [s for s in result.scores if s.status == "SCORED"]
+    if scored:
+        click.echo("\nScored:")
+    for s in scored:
         click.echo(
             f"  {s.id}  period={s.financial_period_id}  "
             f"rev_err={s.revenue_error_pct}%  pat_err={s.pat_error_pct}%  "
@@ -1509,6 +1655,7 @@ def backtest_report_cmd(symbol: str | None, sector: str | None, model_version: s
 
 
 def _print_summary(summary: dict) -> None:
+    click.echo(f"  Scorable / unscorable: {summary['n'] - summary['unscorable_n']} / {summary['unscorable_n']}")
     click.echo(f"  Revenue MAPE      : {summary['revenue_mape_pct']}% (n={summary['revenue_mape_n']})")
     click.echo(f"  PAT MAPE          : {summary['pat_mape_pct']}% (n={summary['pat_mape_n']})")
     click.echo(f"  EPS MAPE          : {summary['eps_mape_pct']}% (n={summary['eps_mape_n']})")

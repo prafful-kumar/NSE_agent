@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from click.testing import CliRunner
 
 from investing_agent.cli import cli
+from investing_agent.services.backtesting.runner import BacktestRunResult
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -43,6 +44,7 @@ def _fake_score(**overrides) -> MagicMock:
         id=uuid.uuid4(), financial_period_id=uuid.uuid4(),
         revenue_error_pct=Decimal("2.5"), pat_error_pct=Decimal("-3.1"), eps_error_pct=Decimal("1.0"),
         surprise_direction="inline", within_band_pat=True, confidence_bucket="medium",
+        status="SCORED",
     )
     defaults.update(overrides)
     return MagicMock(**defaults)
@@ -52,7 +54,7 @@ class TestRunBacktestCommand:
     def test_symbol_given_resolves_company_and_scopes_run(self) -> None:
         session = AsyncMock()
         company = SimpleNamespace(id=uuid.uuid4(), symbol="BEL")
-        scores = [_fake_score()]
+        run_result = BacktestRunResult(scores=[_fake_score()], diagnostics=[])
 
         with (
             patch("investing_agent.db.session.AsyncSessionLocal", _fake_session_factory(session)),
@@ -62,7 +64,7 @@ class TestRunBacktestCommand:
             ),
             patch(
                 "investing_agent.services.backtesting.runner.run_backtest",
-                AsyncMock(return_value=scores),
+                AsyncMock(return_value=run_result),
             ) as run_backtest_fn,
         ):
             result = CliRunner().invoke(cli, ["run-backtest", "--symbol", "BEL"])
@@ -81,7 +83,7 @@ class TestRunBacktestCommand:
             patch("investing_agent.db.session.AsyncSessionLocal", _fake_session_factory(session)),
             patch(
                 "investing_agent.services.backtesting.runner.run_backtest",
-                AsyncMock(return_value=[]),
+                AsyncMock(return_value=BacktestRunResult()),
             ) as run_backtest_fn,
         ):
             result = CliRunner().invoke(cli, ["run-backtest"])
@@ -97,7 +99,7 @@ class TestRunBacktestCommand:
             patch("investing_agent.db.session.AsyncSessionLocal", _fake_session_factory(session)),
             patch(
                 "investing_agent.services.backtesting.runner.run_backtest",
-                AsyncMock(return_value=[]),
+                AsyncMock(return_value=BacktestRunResult()),
             ) as run_backtest_fn,
         ):
             result = CliRunner().invoke(
@@ -129,6 +131,7 @@ def _score_row(
     company_id, financial_period_id=None, model_version="deterministic-v1",
     pat_error_pct=None, within_band_pat=None, surprise_direction=None,
     growth_direction_correct=None, confidence_bucket=None,
+    status="SCORED", unscorable_reason=None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid.uuid4(), company_id=company_id,
@@ -140,6 +143,8 @@ def _score_row(
         within_band_revenue=None, within_band_pat=within_band_pat, within_band_eps=None,
         surprise_direction=surprise_direction, growth_direction_correct=growth_direction_correct,
         confidence_bucket=confidence_bucket,
+        status=status, unscorable_reason=unscorable_reason,
+        verified_history_count=2, unverified_history_count=0,
         created_at=NOW, updated_at=NOW,
     )
 

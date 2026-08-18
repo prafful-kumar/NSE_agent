@@ -13,7 +13,7 @@ To start the test DB: docker-compose up postgres_test -d
 """
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -126,7 +126,7 @@ class TestFullFeatureSnapshotComposition:
                 cash_equivalents=None, operating_cash_flow=None, roe_pct=None, roce_pct=None,
                 other_metrics={}, source_type="test", source_url=None,
                 published_at=datetime.now(UTC), data_category="fact", confidence=None,
-                source_document_id=None,
+                source_document_id=None, verification_status="verified",
             )
         )
 
@@ -214,6 +214,8 @@ class TestFullFeatureSnapshotComposition:
 
         assert len(payload.historical_financials) == 1
         assert payload.historical_financials[0].revenue == Decimal("1050")
+        assert payload.verified_history_count == 1
+        assert payload.unverified_history_count == 0
 
         assert payload.order_book is not None
         assert payload.order_book.order_book_value == Decimal("5000")
@@ -272,6 +274,85 @@ class TestFullFeatureSnapshotComposition:
         assert payload.recent_news[0].impact_classification is None
 
 
+class TestHistoricalVerificationFiltering:
+    """The PIT-diagnosis fix: an NSE structured-API row (verification_status
+    default "unverified") must never feed the estimator on its own — only
+    verification_status=="verified" rows become HistoricalFinancialPoints.
+    See services/estimation/features.py::_build_historical_financials."""
+
+    async def test_unverified_row_is_excluded_but_counted(
+        self, db_session, company, target_period
+    ) -> None:
+        from investing_agent.db.repositories.financial import (
+            FinancialPeriodRepository,
+            FinancialResultRepository,
+        )
+
+        period_repo = FinancialPeriodRepository(db_session)
+        result_repo = FinancialResultRepository(db_session)
+        hist_period = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q2", date(2025, 9, 30), "Q2FY26"
+        )
+        await result_repo.upsert_versioned(
+            FinancialResultCreate(
+                period_id=hist_period.id, company_id=company.id, symbol=company.symbol,
+                statement_scope="CONSOLIDATED", reporting_basis="QUARTER", is_audited=False,
+                result_date=date(2025, 9, 30), currency="INR", unit_scale="CRORE",
+                revenue=Decimal("1050"), ebitda=None, ebitda_margin_pct=Decimal("12"),
+                ebitda_source=None, pbt=None, pat=Decimal("84"), pat_margin_pct=None,
+                eps_basic=None, eps_diluted=Decimal("5"), total_debt=None,
+                cash_equivalents=None, operating_cash_flow=None, roe_pct=None, roce_pct=None,
+                other_metrics={}, source_type="nse_json_hint", source_url=None,
+                published_at=datetime.now(UTC), data_category="fact", confidence=None,
+                source_document_id=None,
+                # verification_status left at its "unverified" default —
+                # this is exactly the NSE JSON-hint scenario the fix targets.
+            )
+        )
+
+        cutoff = datetime.now(UTC)
+        snapshot_row = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        payload = FeatureSnapshotPayload(**snapshot_row.payload)
+
+        assert payload.historical_financials == []
+        assert payload.verified_history_count == 0
+        assert payload.unverified_history_count == 1
+
+    async def test_verified_row_is_included(self, db_session, company, target_period) -> None:
+        from investing_agent.db.repositories.financial import (
+            FinancialPeriodRepository,
+            FinancialResultRepository,
+        )
+
+        period_repo = FinancialPeriodRepository(db_session)
+        result_repo = FinancialResultRepository(db_session)
+        hist_period = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q2", date(2025, 9, 30), "Q2FY26"
+        )
+        await result_repo.upsert_versioned(
+            FinancialResultCreate(
+                period_id=hist_period.id, company_id=company.id, symbol=company.symbol,
+                statement_scope="CONSOLIDATED", reporting_basis="QUARTER", is_audited=False,
+                result_date=date(2025, 9, 30), currency="INR", unit_scale="CRORE",
+                revenue=Decimal("1050"), ebitda=None, ebitda_margin_pct=Decimal("12"),
+                ebitda_source=None, pbt=None, pat=Decimal("84"), pat_margin_pct=None,
+                eps_basic=None, eps_diluted=Decimal("5"), total_debt=None,
+                cash_equivalents=None, operating_cash_flow=None, roe_pct=None, roce_pct=None,
+                other_metrics={}, source_type="nse_filing_pdf", source_url=None,
+                published_at=datetime.now(UTC), data_category="fact", confidence=None,
+                source_document_id=None, verification_status="verified",
+            )
+        )
+
+        cutoff = datetime.now(UTC)
+        snapshot_row = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        payload = FeatureSnapshotPayload(**snapshot_row.payload)
+
+        assert len(payload.historical_financials) == 1
+        assert payload.verified_history_count == 1
+        assert payload.unverified_history_count == 0
+
+
 class TestFeatureSnapshotIdempotency:
     async def test_identical_call_returns_the_same_row(self, db_session, company, target_period) -> None:
         cutoff = datetime.now(UTC)
@@ -281,3 +362,90 @@ class TestFeatureSnapshotIdempotency:
         await db_session.flush()
 
         assert first.id == second.id
+
+
+class TestHistoricalAvailableAtIsNotIngestionTime:
+    """PIT regression test for the exact bug the user diagnosed from a real
+    BEL backtest run: a Q3FY25 EstimateRun had cutoff_at in August 2026 —
+    proof that available_at was defaulting to ingestion time rather than
+    reflecting when the actual result was historically published.
+
+    Drives the real, non-bypassed path an NSE JSON-hint row takes: a
+    RawFinancialResult carrying only a result_date (no intraday
+    published_at, exactly like NSE's structured API) ->
+    FinancialResultNormalizer.normalize() (derives available_at from the
+    historical result_date, DATE_ONLY precision, per
+    _derive_provenance_timestamps) -> FinancialResultRepository
+    .upsert_versioned() (persists it) ->
+    FinancialResultRepository.get_earliest_available_at() (what
+    services/backtesting/runner.py actually calls to derive cutoff_at).
+
+    The result published/filed in Jan 2025 must yield a historical
+    (Jan-2025) cutoff -- it must never become "now" (August 2026, when this
+    test happens to run / when a real ingestion run would have executed).
+    """
+
+    async def test_q3fy25_result_filed_jan_2025_yields_a_2025_cutoff_not_the_ingestion_year(
+        self, db_session, company
+    ) -> None:
+        from investing_agent.db.repositories.financial import (
+            FinancialPeriodRepository,
+            FinancialResultRepository,
+        )
+        from investing_agent.services.normalization import FinancialResultNormalizer
+        from investing_agent.services.sources.interfaces import RawFinancialResult
+
+        period_repo = FinancialPeriodRepository(db_session)
+        result_repo = FinancialResultRepository(db_session)
+        period = await period_repo.get_or_create(
+            company.id, "quarter", 2025, "Q3", date(2024, 12, 31), "Q3FY25"
+        )
+
+        raw = RawFinancialResult(
+            period_start="01-Oct-2024",
+            period_end="31-Dec-2024",
+            result_date="30-Jan-2025",
+            revenue="5200",
+            pat="420",
+            pbt="560",
+            eps_basic="1.15",
+            is_audited_hint=False,
+            statement_scope_hint="CONSOLIDATED",
+            unit_scale_hint="CRORE",
+            extraction_method="structured_api",
+            raw={},
+        )
+
+        data = FinancialResultNormalizer().normalize(
+            raw,
+            company_id=company.id,
+            period_id=period.id,
+            symbol=company.symbol,
+            source_type="nse_json_hint",
+            source_url=None,
+            # The real NSE JSON-hint ingestion path has no intraday
+            # publication timestamp -- only result_date. published_at=None
+            # here is what forces the DATE_ONLY derivation path.
+            published_at=None,
+            source_document_id=None,
+        )
+        assert data.available_at is not None
+        assert data.available_at.year == 2025
+        assert data.available_at.month == 1
+        assert data.timestamp_precision == "DATE_ONLY"
+
+        await result_repo.upsert_versioned(data)
+        await db_session.flush()
+
+        earliest_available_at = await result_repo.get_earliest_available_at(period.id)
+
+        assert earliest_available_at is not None
+        assert earliest_available_at.year == 2025
+        assert earliest_available_at.month == 1
+        # This is the exact invariant the user's diagnosis demands: the
+        # ingestion year (whenever this sync actually runs -- e.g. 2026)
+        # must never leak into the historical cutoff derivation.
+        assert earliest_available_at.year != datetime.now(UTC).year
+
+        cutoff_at = earliest_available_at - timedelta(seconds=1)
+        assert cutoff_at.year == 2025

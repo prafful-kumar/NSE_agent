@@ -275,6 +275,14 @@ class NSEDataSource(CorporateActionSource, FinancialResultSource, FilingSource):
         for row in rows:
             desc = row.get("desc") or row.get("subject")
             filing_date = row.get("an_dt") or row.get("sort_date")
+            # NSE uses the literal string "-" as attchmntFile's sentinel for
+            # "no attachment on this announcement" (observed on BEL/HAL) —
+            # normalized to None here so every consumer's existing
+            # `if not document_url` guard treats it as absent, rather than
+            # attempting an HTTP GET on the string "-".
+            attachment_url = row.get("attchmntFile")
+            if attachment_url == "-":
+                attachment_url = None
             out.append(
                 RawAnnouncement(
                     provider="NSE",
@@ -283,7 +291,7 @@ class NSEDataSource(CorporateActionSource, FinancialResultSource, FilingSource):
                     title=desc or "(untitled)",
                     filing_date=filing_date,
                     published_at=_parse_nse_announcement_datetime(filing_date),
-                    document_url=row.get("attchmntFile"),
+                    document_url=attachment_url,
                     source_url=url,
                     raw=row,
                 )

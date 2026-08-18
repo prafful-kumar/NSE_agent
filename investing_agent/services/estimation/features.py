@@ -72,9 +72,12 @@ async def build_feature_snapshot(
         label=target_period.label,
     )
 
-    historical_financials, used_unresolved_scope = await _build_historical_financials(
-        session, company_id, target_period, cutoff_at
-    )
+    (
+        historical_financials,
+        used_unresolved_scope,
+        verified_history_count,
+        unverified_history_count,
+    ) = await _build_historical_financials(session, company_id, target_period, cutoff_at)
     order_book = await _build_order_book(session, company_id, cutoff_at)
     guidance = await _build_guidance(session, company_id, target_period.fiscal_year, cutoff_at)
     segment_metrics = await _build_segment_metrics(session, company_id, cutoff_at)
@@ -94,6 +97,8 @@ async def build_feature_snapshot(
         active_risks=active_risks,
         recent_news=recent_news,
         used_unresolved_scope=used_unresolved_scope,
+        verified_history_count=verified_history_count,
+        unverified_history_count=unverified_history_count,
     )
 
     return await snapshot_repo.get_or_create(
@@ -108,7 +113,19 @@ async def build_feature_snapshot(
 
 async def _build_historical_financials(
     session, company_id: uuid.UUID, target_period: FinancialPeriod, cutoff_at: datetime
-) -> tuple[list[HistoricalFinancialPoint], bool]:
+) -> tuple[list[HistoricalFinancialPoint], bool, int, int]:
+    """Returns (points, used_unresolved_scope, verified_history_count,
+    unverified_history_count).
+
+    Only verification_status=="verified" rows ever become a
+    HistoricalFinancialPoint — an unreconciled NSE JSON-hint row
+    (source_type="nse_json_hint") is not trustworthy enough to feed the
+    estimator on its own (see the empirically-documented BEL
+    re_con_pro_loss scope mislabeling: an API value that "looks" like a
+    fact can still be wrong). verified_history_count/unverified_history_count
+    are computed over every non-leaked candidate row (any scope), for
+    diagnostics — see run_backtest's UNSCORABLE/NO_VERIFIED_HISTORY marking.
+    """
     result_repo = FinancialResultRepository(session)
     results = await result_repo.list_by_company_as_of(company_id, cutoff_at)
 
@@ -133,10 +150,20 @@ async def _build_historical_financials(
             continue
         by_period.setdefault(r.period_id, []).append((period, r))
 
+    verified_history_count = 0
+    unverified_history_count = 0
+    for rows in by_period.values():
+        for _period, r in rows:
+            if r.verification_status == "verified":
+                verified_history_count += 1
+            else:
+                unverified_history_count += 1
+
     points: list[HistoricalFinancialPoint] = []
     used_unresolved_scope = False
     for period_id, rows in by_period.items():
-        rows_by_scope = {r.statement_scope: (period, r) for period, r in rows}
+        verified_rows = [(period, r) for period, r in rows if r.verification_status == "verified"]
+        rows_by_scope = {r.statement_scope: (period, r) for period, r in verified_rows}
         for scope in _SCOPE_PREFERENCE:
             if scope in rows_by_scope:
                 period, r = rows_by_scope[scope]
@@ -158,7 +185,7 @@ async def _build_historical_financials(
                 break
 
     points.sort(key=lambda p: p.period_end)
-    return points, used_unresolved_scope
+    return points, used_unresolved_scope, verified_history_count, unverified_history_count
 
 
 async def _build_order_book(session, company_id: uuid.UUID, cutoff_at: datetime) -> OrderBookPoint | None:

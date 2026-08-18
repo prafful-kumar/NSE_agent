@@ -50,7 +50,16 @@ log = structlog.get_logger(__name__)
 # (general announcements, order/contract wins, etc.) is still returned in
 # RawAnnouncement form by the source for discovery/visibility, just never
 # auto-archived — see module docstring.
-_AUTO_ARCHIVE_TYPES = frozenset({"investor_presentation", "concall_transcript"})
+#
+# quarterly_result is included so the manual verification workflow
+# (services/verification.py::verify_financial_result_manual, cli.py's
+# verify-financial-result) has a Tier-1 primary document — the archived
+# filing PDF, with a real announcement timestamp — to check the NSE
+# structured-API ("nse_json_hint") FinancialResult rows against, rather
+# than relying on secondary financial websites.
+_AUTO_ARCHIVE_TYPES = frozenset(
+    {"investor_presentation", "concall_transcript", "quarterly_result"}
+)
 
 
 @dataclass

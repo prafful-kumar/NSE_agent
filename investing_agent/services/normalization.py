@@ -13,12 +13,18 @@ output field is left None/UNRESOLVED rather than guessed.
 """
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from investing_agent.schemas.corporate_actions import CorporateActionCreate
 from investing_agent.schemas.financials import FinancialResultCreate
 from investing_agent.services.sources.interfaces import RawCorporateAction, RawFinancialResult
+
+# NSE's result_date (re_create_dt) is an IST calendar date with no time
+# component — used only to derive a conservative UTC estimate, never
+# presented as an exact intraday timestamp. See
+# _derive_provenance_timestamps.
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -85,6 +91,39 @@ def resolve_reporting_basis(period_start: date | None, period_end: date | None) 
     return "QUARTER" if span_days <= 100 else "YTD"
 
 
+def _derive_provenance_timestamps(
+    published_at: datetime | None, result_date: date | None
+) -> tuple[datetime | None, datetime | None, str]:
+    """Policy for published_at/available_at/timestamp_precision on a
+    FinancialResult, per the PIT-correctness fix: available_at must never
+    silently default to our own ingestion time when a trustworthy
+    historical timestamp exists.
+
+    - A real intraday published_at (e.g. an archived filing's announcement
+      time) is trusted as-is, EXACT precision, and used for available_at
+      too (same-day dissemination assumed absent contrary evidence).
+    - Absent that, but with a result_date (NSE's results-comparision
+      endpoint only ever gives a calendar date, no time): published_at is
+      conservatively estimated as the *start* of that IST day (the
+      earliest it could plausibly have been public) and available_at as
+      the *end* of that IST day (the latest it could plausibly have become
+      knowable) — both converted to UTC, both tagged DATE_ONLY. This never
+      claims a specific time we don't actually know, and errs toward
+      *later* availability, so a PIT backtest cutoff derived from
+      available_at can't accidentally leak same-day information.
+    - With neither signal, both are None — the caller leaves available_at
+      unset on FinancialResultCreate, and the DB's server_default (our own
+      ingestion time) applies as a last resort, not a policy choice.
+    """
+    if published_at is not None:
+        return published_at, published_at, "EXACT"
+    if result_date is not None:
+        derived_published_at = datetime.combine(result_date, time(0, 0, 0), tzinfo=_IST)
+        derived_available_at = datetime.combine(result_date, time(23, 59, 59), tzinfo=_IST)
+        return derived_published_at, derived_available_at, "DATE_ONLY"
+    return None, None, "EXACT"
+
+
 class FinancialResultNormalizer:
     def normalize(
         self,
@@ -100,6 +139,10 @@ class FinancialResultNormalizer:
     ) -> FinancialResultCreate:
         period_start = parse_nse_date(raw.period_start)
         period_end = parse_nse_date(raw.period_end)
+        result_date = parse_nse_date(raw.result_date)
+        derived_published_at, derived_available_at, precision = _derive_provenance_timestamps(
+            published_at, result_date
+        )
 
         return FinancialResultCreate(
             period_id=period_id,
@@ -108,7 +151,7 @@ class FinancialResultNormalizer:
             statement_scope=raw.statement_scope_hint or "UNRESOLVED",
             reporting_basis=resolve_reporting_basis(period_start, period_end),
             is_audited=bool(raw.is_audited_hint) if raw.is_audited_hint is not None else False,
-            result_date=parse_nse_date(raw.result_date),
+            result_date=result_date,
             currency="INR",
             unit_scale=raw.unit_scale_hint or "UNRESOLVED",
             revenue=parse_decimal(raw.revenue),
@@ -131,7 +174,9 @@ class FinancialResultNormalizer:
             other_metrics={"extraction_method": raw.extraction_method, "raw": raw.raw},
             source_type=source_type,
             source_url=source_url,
-            published_at=published_at,
+            published_at=derived_published_at,
+            available_at=derived_available_at,
+            timestamp_precision=precision,
             data_category="fact",
             confidence=None,
             source_document_id=source_document_id,

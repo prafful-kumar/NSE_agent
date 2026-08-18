@@ -79,7 +79,8 @@ async def company(db_session):
 
 
 async def _seed_quarter(
-    session, company, fiscal_year, quarter, period_end, label, revenue, pat=None, eps_diluted=None
+    session, company, fiscal_year, quarter, period_end, label, revenue,
+    pat=None, eps_diluted=None, verified=False,
 ):
     from investing_agent.db.repositories.financial import (
         FinancialPeriodRepository,
@@ -104,6 +105,7 @@ async def _seed_quarter(
             source_type="test", source_url=None,
             published_at=datetime.now(UTC), data_category="fact", confidence=None,
             source_document_id=None,
+            verification_status="verified" if verified else "unverified",
         )
     )
     return period
@@ -123,14 +125,14 @@ class TestRunBacktestWithinASingleTransaction:
             periods[label] = await _seed_quarter(db_session, company, fy, q, pe, label, revenue)
         await db_session.flush()
 
-        scores = await run_backtest(db_session, company_id=company.id)
+        result = await run_backtest(db_session, company_id=company.id)
         await db_session.flush()
 
-        assert len(scores) == 4
+        assert len(result.scores) == 4
         period_ids = {p.id for p in periods.values()}
-        assert {s.financial_period_id for s in scores} == period_ids
+        assert {s.financial_period_id for s in result.scores} == period_ids
 
-        for s in scores:
+        for s in result.scores:
             assert s.model_version == "deterministic-v1"
             # available_at is frozen for the whole transaction (Postgres
             # now() semantics) -- cutoff_at (earliest available_at minus one
@@ -147,6 +149,15 @@ class TestRunBacktestWithinASingleTransaction:
             # Confidence is still Python-computed (never None) even with
             # zero history -- see deterministic.py's confidence floor.
             assert s.confidence_bucket == "low"
+            # No history at all was visible (not even an unverified row) --
+            # an explicit UNSCORABLE marker, not a misleadingly "successful"
+            # all-None score.
+            assert s.status == "UNSCORABLE"
+            assert s.unscorable_reason == "NO_HISTORY_AVAILABLE"
+
+        for d in result.diagnostics:
+            assert d.estimate_status == "UNSCORABLE"
+            assert d.reason == "NO_HISTORY_AVAILABLE"
 
 
 class TestRunBacktestWithGenuineHistoricalSeparation:
@@ -162,9 +173,15 @@ class TestRunBacktestWithGenuineHistoricalSeparation:
                     exchange="NSE", sector="Defence",
                 )
             )
-            await _seed_quarter(session, company, 2024, "Q4", date(2024, 3, 31), "Q4FY24", 950)
-            await _seed_quarter(session, company, 2025, "Q1", date(2024, 6, 30), "Q1FY25", 1000)
-            await _seed_quarter(session, company, 2025, "Q2", date(2024, 9, 30), "Q2FY25", 1050)
+            await _seed_quarter(
+                session, company, 2024, "Q4", date(2024, 3, 31), "Q4FY24", 950, verified=True
+            )
+            await _seed_quarter(
+                session, company, 2025, "Q1", date(2024, 6, 30), "Q1FY25", 1000, verified=True
+            )
+            await _seed_quarter(
+                session, company, 2025, "Q2", date(2024, 9, 30), "Q2FY25", 1050, verified=True
+            )
             await session.commit()
 
         # A genuine wall-clock gap is the only way to get a later now() in a
@@ -179,10 +196,10 @@ class TestRunBacktestWithGenuineHistoricalSeparation:
             await session.commit()
 
         async with AsyncSessionLocal() as session:
-            scores = await run_backtest(session, company_id=company.id)
+            result = await run_backtest(session, company_id=company.id)
             await session.commit()
 
-        target_score = next(s for s in scores if s.financial_period_id == target_period.id)
+        target_score = next(s for s in result.scores if s.financial_period_id == target_period.id)
 
         samples = [
             (Decimal("1000") - Decimal("950")) / Decimal("950"),
@@ -196,6 +213,9 @@ class TestRunBacktestWithGenuineHistoricalSeparation:
 
         assert target_score.revenue_error_pct == expected_error_pct
         assert target_score.within_band_revenue is not None
+        assert target_score.status == "SCORED"
+        assert target_score.unscorable_reason is None
+        assert target_score.verified_history_count == 3
 
         async with AsyncSessionLocal() as session:
             run = await EstimateRunRepository(session).get(target_score.estimate_run_id)

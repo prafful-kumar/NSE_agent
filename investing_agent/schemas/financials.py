@@ -19,6 +19,7 @@ StatementScope = Literal["STANDALONE", "CONSOLIDATED", "UNRESOLVED"]
 ReportingBasis = Literal["QUARTER", "YTD", "ANNUAL"]
 UnitScale = Literal["LAKH", "CRORE", "ACTUAL", "UNRESOLVED"]
 EbitdaSource = Literal["reported", "derived"]
+TimestampPrecision = Literal["EXACT", "DATE_ONLY"]
 
 
 class FinancialPeriodRead(TimestampedSchema):
@@ -62,6 +63,14 @@ class FinancialResultCreate(BaseSchema):
     source_type: str
     source_url: str | None = None
     published_at: datetime | None = None
+    # Explicit override for available_at — set by the normalizer when a
+    # trustworthy historical timestamp (a real filing timestamp, or a
+    # conservative date-derived estimate) exists. None leaves the DB
+    # server_default (ingestion time) in place, which should only happen
+    # when genuinely no better signal is available. See
+    # services/normalization.py::_derive_provenance_timestamps.
+    available_at: datetime | None = None
+    timestamp_precision: TimestampPrecision = "EXACT"
     data_category: str = "fact"
     confidence: float | None = None
     source_document_id: uuid.UUID | None = None
@@ -103,6 +112,7 @@ class FinancialResultRead(TimestampedSchema):
     source_url: str | None
     published_at: datetime | None
     available_at: datetime
+    timestamp_precision: str
     data_category: str
     verification_status: str
     verification_method: str | None

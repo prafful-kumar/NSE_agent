@@ -18,6 +18,8 @@ from investing_agent.schemas.common import BaseSchema, TimestampedSchema
 
 SurpriseDirection = Literal["beat", "inline", "miss"]
 ConfidenceBucket = Literal["low", "medium", "high"]
+BacktestStatus = Literal["SCORED", "UNSCORABLE"]
+UnscorableReason = Literal["NO_VERIFIED_HISTORY", "NO_HISTORY_AVAILABLE"]
 
 
 class BacktestScoreCreate(BaseSchema):
@@ -37,6 +39,10 @@ class BacktestScoreCreate(BaseSchema):
     surprise_direction: SurpriseDirection | None = None
     growth_direction_correct: bool | None = None
     confidence_bucket: ConfidenceBucket | None = None
+    status: BacktestStatus = "SCORED"
+    unscorable_reason: UnscorableReason | None = None
+    verified_history_count: int = 0
+    unverified_history_count: int = 0
 
 
 class BacktestScoreRead(TimestampedSchema):
@@ -57,3 +63,23 @@ class BacktestScoreRead(TimestampedSchema):
     surprise_direction: str | None
     growth_direction_correct: bool | None
     confidence_bucket: str | None
+    status: str
+    unscorable_reason: str | None
+    verified_history_count: int
+    unverified_history_count: int
+
+
+class BacktestDiagnostic(BaseSchema):
+    """One row per period run_backtest looked at — including periods that
+    never produced a BacktestScore at all (no actual available_at yet).
+    Not persisted; CLI-display only, see cli.py's run-backtest command."""
+
+    period_id: uuid.UUID
+    period_label: str
+    actual_available_at: datetime | None
+    actual_ingested_at: datetime | None
+    cutoff_at: datetime | None
+    verified_history_count: int
+    unverified_history_count: int
+    estimate_status: Literal["SCORED", "UNSCORABLE", "SKIPPED"]
+    reason: str | None

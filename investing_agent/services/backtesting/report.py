@@ -46,17 +46,27 @@ def _surprise_direction_distribution_pct(scores: Sequence[BacktestScoreRead]) ->
 
 
 def summarize(scores: Sequence[BacktestScoreRead]) -> dict:
-    revenue_mape, revenue_mape_n = _mean_abs(scores, "revenue_error_pct")
-    pat_mape, pat_mape_n = _mean_abs(scores, "pat_error_pct")
-    eps_mape, eps_mape_n = _mean_abs(scores, "eps_error_pct")
-    margin_mae, margin_mae_n = _mean_abs(scores, "margin_error_bps")
-    revenue_hit, revenue_hit_n = _hit_rate_pct(scores, "within_band_revenue")
-    pat_hit, pat_hit_n = _hit_rate_pct(scores, "within_band_pat")
-    eps_hit, eps_hit_n = _hit_rate_pct(scores, "within_band_eps")
-    direction_accuracy, direction_n = _hit_rate_pct(scores, "growth_direction_correct")
+    # UNSCORABLE rows (no verified history — see runner.py) are excluded
+    # from every accuracy metric below: their numeric fields are already
+    # all None so _mean_abs/_hit_rate_pct would skip them anyway, but
+    # excluding them explicitly from the denominator keeps "n" (and
+    # unscorable_n) an honest sample-size signal rather than something a
+    # reader has to cross-reference against per-field n's to interpret.
+    scored = [s for s in scores if s.status == "SCORED"]
+    unscorable_n = len(scores) - len(scored)
+
+    revenue_mape, revenue_mape_n = _mean_abs(scored, "revenue_error_pct")
+    pat_mape, pat_mape_n = _mean_abs(scored, "pat_error_pct")
+    eps_mape, eps_mape_n = _mean_abs(scored, "eps_error_pct")
+    margin_mae, margin_mae_n = _mean_abs(scored, "margin_error_bps")
+    revenue_hit, revenue_hit_n = _hit_rate_pct(scored, "within_band_revenue")
+    pat_hit, pat_hit_n = _hit_rate_pct(scored, "within_band_pat")
+    eps_hit, eps_hit_n = _hit_rate_pct(scored, "within_band_eps")
+    direction_accuracy, direction_n = _hit_rate_pct(scored, "growth_direction_correct")
 
     return {
         "n": len(scores),
+        "unscorable_n": unscorable_n,
         "revenue_mape_pct": revenue_mape, "revenue_mape_n": revenue_mape_n,
         "pat_mape_pct": pat_mape, "pat_mape_n": pat_mape_n,
         "eps_mape_pct": eps_mape, "eps_mape_n": eps_mape_n,
@@ -65,7 +75,7 @@ def summarize(scores: Sequence[BacktestScoreRead]) -> dict:
         "pat_within_band_pct": pat_hit, "pat_within_band_n": pat_hit_n,
         "eps_within_band_pct": eps_hit, "eps_within_band_n": eps_hit_n,
         "growth_direction_accuracy_pct": direction_accuracy, "growth_direction_n": direction_n,
-        "surprise_direction_distribution_pct": _surprise_direction_distribution_pct(scores),
+        "surprise_direction_distribution_pct": _surprise_direction_distribution_pct(scored),
     }
 
 

@@ -110,6 +110,15 @@ class FeatureSnapshotPayload(BaseSchema):
     active_risks: list[RiskPoint] = []
     recent_news: list[NewsSignalPoint] = []
     used_unresolved_scope: bool = False
+    # Row counts among historical candidates considered for this snapshot
+    # (pre-scope-resolution, post-leakage-guard): how many had
+    # verification_status == "verified" and thus could actually be used,
+    # vs. how many existed but were excluded for lacking corroboration
+    # against a primary document. Both 0 means no history existed at all
+    # (a different failure mode from history existing but being unverified)
+    # — see services/estimation/features.py.
+    verified_history_count: int = 0
+    unverified_history_count: int = 0
 
 
 class FeatureSnapshotCreate(BaseSchema):

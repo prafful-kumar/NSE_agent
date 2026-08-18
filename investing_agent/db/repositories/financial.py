@@ -103,7 +103,16 @@ class FinancialResultRepository(BaseRepository[FinancialResult]):
         )
 
         if existing and _values_equal(existing, data):
-            return existing, False  # idempotent — identical re-ingestion
+            # Idempotent re-ingestion of unchanged reported values. Still
+            # refresh provenance metadata in place (never a new version —
+            # this isn't a restatement, it's correcting our own record of
+            # when the value became known) so re-running a sync after fixing
+            # the timestamp-derivation policy actually corrects
+            # already-ingested rows instead of silently leaving their stale
+            # ingestion-time available_at in place.
+            self._refresh_provenance(existing, data)
+            await self.session.flush()
+            return existing, False
 
         version = (existing.version + 1) if existing else 1
         row = FinancialResult(
@@ -137,6 +146,7 @@ class FinancialResultRepository(BaseRepository[FinancialResult]):
             source_type=data.source_type,
             source_url=data.source_url,
             published_at=data.published_at,
+            timestamp_precision=data.timestamp_precision,
             data_category=data.data_category,
             confidence=data.confidence,
             source_document_id=data.source_document_id,
@@ -146,6 +156,12 @@ class FinancialResultRepository(BaseRepository[FinancialResult]):
             verification_method=data.verification_method,
             verification_notes=data.verification_notes,
         )
+        # available_at has a server_default (ingestion time) — only set it
+        # explicitly when the caller derived a trustworthy value, so the
+        # DB default remains the documented last-resort fallback rather
+        # than something we always override with a Python None.
+        if data.available_at is not None:
+            row.available_at = data.available_at
         await self.add(row)
 
         if existing:
@@ -153,6 +169,15 @@ class FinancialResultRepository(BaseRepository[FinancialResult]):
             await self.session.flush()
 
         return row, True
+
+    @staticmethod
+    def _refresh_provenance(existing: FinancialResult, data: FinancialResultCreate) -> None:
+        if data.available_at is not None and existing.available_at != data.available_at:
+            existing.available_at = data.available_at
+        if data.published_at is not None and existing.published_at != data.published_at:
+            existing.published_at = data.published_at
+        if existing.timestamp_precision != data.timestamp_precision:
+            existing.timestamp_precision = data.timestamp_precision
 
     async def get_history(
         self, period_id: uuid.UUID, statement_scope: str, reporting_basis: str, source_type: str
@@ -237,3 +262,64 @@ class FinancialResultRepository(BaseRepository[FinancialResult]):
             if current is None or row.version > current.version:
                 latest_per_group[key] = row
         return list(latest_per_group.values())
+
+    async def list_latest_by_period(
+        self, period_id: uuid.UUID, statement_scope: str, reporting_basis: str
+    ) -> list[FinancialResult]:
+        """Every is_latest row for a period+scope+basis, across all
+        source_types — used by the manual verification workflow, which
+        doesn't know in advance which adapter's row it's cross-checking."""
+        result = await self.session.execute(
+            select(FinancialResult).where(
+                FinancialResult.period_id == period_id,
+                FinancialResult.statement_scope == statement_scope,
+                FinancialResult.reporting_basis == reporting_basis,
+                FinancialResult.is_latest.is_(True),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def set_verification(
+        self,
+        result_id: uuid.UUID,
+        *,
+        verification_status: str,
+        verification_document_id: uuid.UUID,
+        verified_at: datetime,
+        verification_method: str,
+        verification_notes: str | None = None,
+    ) -> FinancialResult:
+        """In-place update of the verification trail on an existing row —
+        never a new version, since reconciling a value against a primary
+        document doesn't change the reported value itself, only our
+        confidence in it."""
+        row = await self.get(result_id)
+        if row is None:
+            raise ValueError(f"financial_result {result_id} not found")
+        row.verification_status = verification_status
+        row.verification_document_id = verification_document_id
+        row.verified_at = verified_at
+        row.verification_method = verification_method
+        row.verification_notes = verification_notes
+        await self.session.flush()
+        return row
+
+    async def upgrade_timestamp_precision(
+        self,
+        result_id: uuid.UUID,
+        *,
+        published_at: datetime,
+        available_at: datetime,
+    ) -> FinancialResult:
+        """In-place correction once a real intraday timestamp is obtained
+        (e.g. from a matched archived filing's announcement time) for a row
+        that was previously DATE_ONLY. Never downgrades EXACT to
+        DATE_ONLY."""
+        row = await self.get(result_id)
+        if row is None:
+            raise ValueError(f"financial_result {result_id} not found")
+        row.published_at = published_at
+        row.available_at = available_at
+        row.timestamp_precision = "EXACT"
+        await self.session.flush()
+        return row

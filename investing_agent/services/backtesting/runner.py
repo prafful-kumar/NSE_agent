@@ -18,15 +18,17 @@ estimator rather than a separate, possibly-diverging implementation.
 """
 
 import uuid
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from investing_agent.db.models import BacktestScore, FinancialResult
+from investing_agent.db.models import BacktestScore, FinancialPeriod, FinancialResult
 from investing_agent.db.repositories.backtesting import BacktestScoreRepository
 from investing_agent.db.repositories.company import CompanyRepository
 from investing_agent.db.repositories.estimation import FeatureSnapshotRepository
 from investing_agent.db.repositories.financial import FinancialResultRepository
+from investing_agent.schemas.backtesting import BacktestDiagnostic
 from investing_agent.schemas.estimation import EstimateRunRead, FeatureSnapshotPayload
 from investing_agent.schemas.financials import FinancialResultRead
 from investing_agent.services.backtesting.scoring import score_estimate
@@ -44,13 +46,19 @@ def _pick_preferred_scope(rows: list[FinancialResult]) -> FinancialResult | None
     return None
 
 
+@dataclass
+class BacktestRunResult:
+    scores: list[BacktestScore] = field(default_factory=list)
+    diagnostics: list[BacktestDiagnostic] = field(default_factory=list)
+
+
 async def run_backtest(
     session: AsyncSession,
     *,
     company_id: uuid.UUID | None = None,
     model_version: str = "deterministic-v1",
     narrator: EstimateNarrator | None = None,
-) -> list[BacktestScore]:
+) -> BacktestRunResult:
     company_repo = CompanyRepository(session)
     result_repo = FinancialResultRepository(session)
     snapshot_repo = FeatureSnapshotRepository(session)
@@ -63,7 +71,7 @@ async def run_backtest(
     else:
         companies = await company_repo.list()
 
-    scores: list[BacktestScore] = []
+    result = BacktestRunResult()
 
     for company in companies:
         results = await result_repo.list_by_company(company.id)
@@ -78,8 +86,22 @@ async def run_backtest(
             if actual_row is None:
                 continue
 
+            period = await session.get(FinancialPeriod, period_id)
+            period_label = period.label if period is not None else str(period_id)
+
             earliest_available_at = await result_repo.get_earliest_available_at(period_id)
             if earliest_available_at is None:
+                # No actual has a known available_at at all yet — nothing to
+                # derive a PIT-safe cutoff from. Skip entirely (no score, no
+                # misleading "attempted" row) rather than guess an offset.
+                result.diagnostics.append(
+                    BacktestDiagnostic(
+                        period_id=period_id, period_label=period_label,
+                        actual_available_at=None, actual_ingested_at=actual_row.ingested_at,
+                        cutoff_at=None, verified_history_count=0, unverified_history_count=0,
+                        estimate_status="SKIPPED", reason="NO_ACTUAL_AVAILABLE_AT",
+                    )
+                )
                 continue
             cutoff_at = earliest_available_at - timedelta(seconds=1)
 
@@ -96,12 +118,39 @@ async def run_backtest(
                 payload.historical_financials[-1].pat if payload.historical_financials else None
             )
 
+            verified_n = payload.verified_history_count
+            unverified_n = payload.unverified_history_count
+            if verified_n == 0 and unverified_n == 0:
+                status, reason = "UNSCORABLE", "NO_HISTORY_AVAILABLE"
+            elif verified_n == 0:
+                status, reason = "UNSCORABLE", "NO_VERIFIED_HISTORY"
+            else:
+                status, reason = "SCORED", None
+
             score_data = score_estimate(
                 run=EstimateRunRead.model_validate(run),
                 actual=FinancialResultRead.model_validate(actual_row),
                 baseline_pat=baseline_pat,
             )
+            score_data = score_data.model_copy(
+                update={
+                    "status": status,
+                    "unscorable_reason": reason,
+                    "verified_history_count": verified_n,
+                    "unverified_history_count": unverified_n,
+                }
+            )
             score = await score_repo.create(score_data)
-            scores.append(score)
+            result.scores.append(score)
+            result.diagnostics.append(
+                BacktestDiagnostic(
+                    period_id=period_id, period_label=period_label,
+                    actual_available_at=actual_row.available_at,
+                    actual_ingested_at=actual_row.ingested_at,
+                    cutoff_at=cutoff_at,
+                    verified_history_count=verified_n, unverified_history_count=unverified_n,
+                    estimate_status=status, reason=reason,
+                )
+            )
 
-    return scores
+    return result

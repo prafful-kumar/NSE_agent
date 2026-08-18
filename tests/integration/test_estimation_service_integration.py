@@ -89,7 +89,7 @@ async def _make_quarter_result(
             roe_pct=None, roce_pct=None, other_metrics={},
             source_type="test", source_url=None,
             published_at=datetime.now(UTC), data_category="fact", confidence=None,
-            source_document_id=None,
+            source_document_id=None, verification_status="verified",
         )
     )
     await db_session.flush()

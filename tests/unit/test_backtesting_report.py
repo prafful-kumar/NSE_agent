@@ -21,6 +21,8 @@ def _score(**overrides) -> BacktestScoreRead:
         revenue_error_pct=None, pat_error_pct=None, eps_error_pct=None, margin_error_bps=None,
         within_band_revenue=None, within_band_pat=None, within_band_eps=None,
         surprise_direction=None, growth_direction_correct=None, confidence_bucket=None,
+        status="SCORED", unscorable_reason=None,
+        verified_history_count=2, unverified_history_count=0,
         created_at=NOW, updated_at=NOW,
     )
     defaults.update(overrides)

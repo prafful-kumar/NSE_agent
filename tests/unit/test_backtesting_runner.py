@@ -16,6 +16,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from investing_agent.schemas.backtesting import BacktestScoreCreate
 from investing_agent.services.backtesting.runner import run_backtest
 
 COMPANY_ID = uuid.uuid4()
@@ -36,7 +37,12 @@ def _result_row(period_id=PERIOD_ID, scope="CONSOLIDATED", reporting_basis="QUAR
     return row
 
 
-def _snapshot_row(historical_pats: list[str] | None = None):
+def _snapshot_row(
+    historical_pats: list[str] | None = None,
+    *,
+    verified_history_count: int | None = None,
+    unverified_history_count: int = 0,
+):
     historical = [
         {
             "fiscal_year": 2025, "quarter": "Q2", "period_type": "quarter",
@@ -45,6 +51,13 @@ def _snapshot_row(historical_pats: list[str] | None = None):
         }
         for pat in (historical_pats or [])
     ]
+    if verified_history_count is None:
+        # Default assumes every point in historical_pats is a verified,
+        # usable comparable — matches every pre-existing test's intent
+        # (they were written before the verified/unverified distinction
+        # existed). Tests exercising UNSCORABLE marking pass this
+        # explicitly.
+        verified_history_count = len(historical)
     row = MagicMock(id=SNAPSHOT_ID)
     row.payload = {
         "target_period": {
@@ -52,6 +65,8 @@ def _snapshot_row(historical_pats: list[str] | None = None):
             "period_end": "2025-12-31", "label": "Q3FY25",
         },
         "historical_financials": historical,
+        "verified_history_count": verified_history_count,
+        "unverified_history_count": unverified_history_count,
     }
     return row
 
@@ -65,6 +80,9 @@ class _Harness:
         self.snapshot = snapshot or _snapshot_row()
         self.generated_run = MagicMock(id=uuid.uuid4(), feature_snapshot_id=self.snapshot.id)
         self.created_score = MagicMock(id=uuid.uuid4())
+
+        self.session = AsyncMock()
+        self.session.get = AsyncMock(return_value=MagicMock(label="Q3FY25"))
 
         self.company_repo = MagicMock()
         self.company_repo.get = AsyncMock(return_value=_company())
@@ -83,7 +101,20 @@ class _Harness:
         self.service = MagicMock()
         self.service.generate_estimate = AsyncMock(return_value=self.generated_run)
 
-        self.score_estimate_fn = MagicMock(return_value=MagicMock())
+        # A real BacktestScoreCreate (not a bare MagicMock) so runner.py's
+        # score_data.model_copy(update={...}) — where it layers on
+        # status/unscorable_reason/verified & unverified history counts —
+        # behaves exactly as it does against the real score_estimate().
+        self.score_estimate_fn = MagicMock(
+            return_value=BacktestScoreCreate(
+                company_id=COMPANY_ID,
+                financial_period_id=PERIOD_ID,
+                estimate_run_id=self.generated_run.id,
+                financial_result_id=uuid.uuid4(),
+                cutoff_at=EARLIEST_AVAILABLE_AT,
+                model_version="deterministic-v1",
+            )
+        )
 
     def patches(self):
         return (
@@ -105,7 +136,7 @@ async def _run(harness: _Harness, **kwargs):
     # keep them accessible for tests that assert on model_validate call args.
     harness.run_read_cls, harness.result_read_cls = entered[-2], entered[-1]
     try:
-        return await run_backtest(AsyncMock(), **kwargs)
+        return await run_backtest(harness.session, **kwargs)
     finally:
         for cm in reversed(ctx_managers):
             cm.__exit__(None, None, None)
@@ -122,10 +153,13 @@ class TestCutoffDerivation:
 
     async def test_period_with_no_available_at_is_skipped(self) -> None:
         harness = _Harness(results=[_result_row()], earliest_available_at=None)
-        scores = await _run(harness)
+        result = await _run(harness)
 
         harness.service.generate_estimate.assert_not_awaited()
-        assert scores == []
+        assert result.scores == []
+        assert len(result.diagnostics) == 1
+        assert result.diagnostics[0].estimate_status == "SKIPPED"
+        assert result.diagnostics[0].reason == "NO_ACTUAL_AVAILABLE_AT"
 
 
 class TestScopePreference:
@@ -151,19 +185,19 @@ class TestScopePreference:
 class TestPeriodFiltering:
     async def test_annual_reporting_basis_rows_are_excluded(self) -> None:
         harness = _Harness(results=[_result_row(reporting_basis="ANNUAL")])
-        scores = await _run(harness)
+        result = await _run(harness)
 
         harness.service.generate_estimate.assert_not_awaited()
-        assert scores == []
+        assert result.scores == []
 
     async def test_multiple_periods_each_generate_one_estimate(self) -> None:
         other_period_id = uuid.uuid4()
         rows = [_result_row(period_id=PERIOD_ID), _result_row(period_id=other_period_id)]
         harness = _Harness(results=rows)
-        scores = await _run(harness)
+        result = await _run(harness)
 
         assert harness.service.generate_estimate.await_count == 2
-        assert len(scores) == 2
+        assert len(result.scores) == 2
 
 
 class TestBaselinePat:
@@ -204,7 +238,41 @@ class TestCompanyScoping:
 class TestPersistence:
     async def test_each_scored_period_persists_one_backtest_score(self) -> None:
         harness = _Harness(results=[_result_row()])
-        scores = await _run(harness)
+        result = await _run(harness)
 
         harness.score_repo.create.assert_awaited_once()
-        assert scores == [harness.created_score]
+        assert result.scores == [harness.created_score]
+
+
+class TestUnscorableMarking:
+    async def test_no_history_at_all_is_unscorable_no_history_available(self) -> None:
+        snapshot = _snapshot_row(verified_history_count=0, unverified_history_count=0)
+        harness = _Harness(results=[_result_row()], snapshot=snapshot)
+        result = await _run(harness)
+
+        create_kwargs = harness.score_repo.create.call_args.args[0]
+        assert create_kwargs.status == "UNSCORABLE"
+        assert create_kwargs.unscorable_reason == "NO_HISTORY_AVAILABLE"
+        assert result.diagnostics[0].estimate_status == "UNSCORABLE"
+        assert result.diagnostics[0].reason == "NO_HISTORY_AVAILABLE"
+
+    async def test_only_unverified_history_is_unscorable_no_verified_history(self) -> None:
+        snapshot = _snapshot_row(verified_history_count=0, unverified_history_count=3)
+        harness = _Harness(results=[_result_row()], snapshot=snapshot)
+        result = await _run(harness)
+
+        create_kwargs = harness.score_repo.create.call_args.args[0]
+        assert create_kwargs.status == "UNSCORABLE"
+        assert create_kwargs.unscorable_reason == "NO_VERIFIED_HISTORY"
+        assert result.diagnostics[0].verified_history_count == 0
+        assert result.diagnostics[0].unverified_history_count == 3
+
+    async def test_verified_history_present_is_scored(self) -> None:
+        snapshot = _snapshot_row(historical_pats=["80", "90"])
+        harness = _Harness(results=[_result_row()], snapshot=snapshot)
+        result = await _run(harness)
+
+        create_kwargs = harness.score_repo.create.call_args.args[0]
+        assert create_kwargs.status == "SCORED"
+        assert create_kwargs.unscorable_reason is None
+        assert result.diagnostics[0].estimate_status == "SCORED"

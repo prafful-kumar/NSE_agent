@@ -540,6 +540,18 @@ class FinancialResult(TimestampMixin, ProvenanceMixin, VerificationMixin, Base):
         UUID(as_uuid=True), ForeignKey("financial_results.id")
     )
 
+    # EXACT|DATE_ONLY — whether published_at/available_at carry a real
+    # intraday timestamp (from an archived filing's announcement time) or
+    # are a conservative estimate derived from a date-only source field
+    # (NSE's results-comparision endpoint only gives a calendar date, never
+    # a time). DATE_ONLY rows use end-of-day IST as available_at — a
+    # deliberately conservative upper bound, never claimed to be exact, and
+    # never allowed to default to our own ingestion time. See
+    # services/normalization.py::_derive_provenance_timestamps.
+    timestamp_precision: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="EXACT"
+    )
+
     period: Mapped["FinancialPeriod"] = relationship(back_populates="results")
 
     __table_args__ = (
@@ -1453,3 +1465,19 @@ class BacktestScore(TimestampMixin, Base):
     # low (<0.40) | medium (<0.70) | high (>=0.70), bucketed from
     # EstimateRun.confidence — used for confidence-calibration reporting.
     confidence_bucket: Mapped[str | None] = mapped_column(String(10))
+
+    # SCORED|UNSCORABLE — an EstimateRun with no usable verified history
+    # still gets a BacktestScore row (for visibility into what was
+    # attempted), but with every numeric field None. Without this flag such
+    # a row is indistinguishable from a genuine "the model tried and got it
+    # right/wrong" score. UNSCORABLE rows are excluded from aggregate
+    # accuracy metrics in services/backtesting/report.py.
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="SCORED")
+    # NO_VERIFIED_HISTORY | NO_HISTORY_AVAILABLE — only set when status is
+    # UNSCORABLE.
+    unscorable_reason: Mapped[str | None] = mapped_column(String(40))
+    # How many/few historical comparable rows the FeatureSnapshot had to
+    # work with, denormalized from FeatureSnapshotPayload for reporting
+    # without a join.
+    verified_history_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unverified_history_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
