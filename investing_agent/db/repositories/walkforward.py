@@ -31,6 +31,15 @@ class WalkForwardRunRepository(BaseRepository[WalkForwardRun]):
         row = WalkForwardRun(**data.model_dump())
         return await self.add(row)
 
+    async def latest_for_account(self, broker_account_id: uuid.UUID) -> WalkForwardRun | None:
+        result = await self.session.execute(
+            select(WalkForwardRun)
+            .where(WalkForwardRun.broker_account_id == broker_account_id)
+            .order_by(WalkForwardRun.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
 
 class WalkForwardDecisionRepository(BaseRepository[WalkForwardDecision]):
     model = WalkForwardDecision

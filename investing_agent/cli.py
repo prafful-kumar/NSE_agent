@@ -2983,6 +2983,162 @@ async def _walk_forward_report(run_id: str, csv_out: str | None) -> None:
         click.echo(f"\nEvent-level audit table written to {csv_out} ({len(rows)} rows)")
 
 
+@cli.command("personal-policy-report")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True, help="Broker account label")
+@click.option("--run-id", default=None, help="Phase 6D run UUID; defaults to the newest account run")
+@click.option("--csv-out", default=None, type=click.Path(dir_okay=False), help="Write patterns and high-impact event traces to CSV")
+def personal_policy_report_cmd(
+    user_id: str | None, broker: str, account_label: str, run_id: str | None, csv_out: str | None
+) -> None:
+    """Phase 6E descriptive learning from a frozen Phase 6D run only."""
+    asyncio.run(_personal_policy_report(user_id, broker, account_label, run_id, csv_out))
+
+
+async def _personal_policy_report(
+    user_id: str | None,
+    broker: str,
+    account_label: str,
+    run_id: str | None,
+    csv_out: str | None,
+) -> None:
+    import csv as csv_module
+    import json
+    import uuid as uuid_module
+
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.repositories.company import CompanyRepository
+    from investing_agent.db.repositories.walkforward import (
+        WalkForwardDecisionRepository,
+        WalkForwardOutcomeRepository,
+        WalkForwardRunRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.personal_policy import (
+        HORIZONS,
+        build_patterns,
+        derive_market_regimes,
+        ranked_impacts,
+    )
+    from investing_agent.services.walkforward.audit import build_audit_rows
+    from investing_agent.services.walkforward.runner import WalkForwardEntry
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+    async with AsyncSessionLocal() as session:
+        account = await BrokerAccountRepository(session).get_by_label(
+            resolved_user_id, broker, account_label
+        )
+        if account is None:
+            click.echo(f"ERROR: no {broker}/{account_label} account for user={resolved_user_id}.", err=True)
+            sys.exit(1)
+        run_repo = WalkForwardRunRepository(session)
+        run = await run_repo.get(uuid_module.UUID(run_id)) if run_id else await run_repo.latest_for_account(account.id)
+        if run is None or run.broker_account_id != account.id:
+            click.echo("ERROR: no matching frozen Phase 6D run for this account.", err=True)
+            sys.exit(1)
+        decisions = await WalkForwardDecisionRepository(session).list_for_run(run.id)
+        outcome_repo = WalkForwardOutcomeRepository(session)
+        entries = [
+            WalkForwardEntry(decision=decision, outcome=outcome)
+            for decision in decisions
+            if (outcome := await outcome_repo.get_by_decision_id(decision.id)) is not None
+        ]
+        rows = await build_audit_rows(session, broker_account_id=account.id, entries=entries)
+        company_repo = CompanyRepository(session)
+        sectors = {}
+        for symbol in {row.symbol for row in rows}:
+            company = await company_repo.get_by_symbol(symbol)
+            sectors[symbol] = company.sector if company else None
+        regimes = await derive_market_regimes(session, rows)
+
+    if not rows:
+        click.echo("No Phase 6D decisions/outcomes found for this run.")
+        return
+
+    patterns = build_patterns(rows, sectors_by_symbol=sectors, regimes_by_decision_id=regimes)
+    meaningful = [pattern for pattern in patterns if pattern.stats.sample_label != "INSUFFICIENT_EVIDENCE"]
+    insufficient = [pattern for pattern in patterns if pattern.stats.sample_label == "INSUFFICIENT_EVIDENCE"]
+    click.echo(f"\nPersonal policy report — run={run.id}, events={len(rows)}")
+    click.echo("Descriptive historical learning only; recommendations and decision rules are unchanged.")
+
+    def print_patterns(title: str, values) -> None:
+        click.echo(f"\n== {title} ==")
+        for pattern in values:
+            stats = pattern.stats
+            click.echo(
+                f"{pattern.population:14s} {pattern.bucket:20s} {pattern.horizon.upper():3s} "
+                f"n={stats.n:<3d} {stats.sample_label:21s} "
+                f"med_excess={stats.median_excess_return_pct}% impact={stats.median_decision_dollar_impact}"
+            )
+
+    for dimension, title in (
+        ("overall", "Overall / excluding 2020"),
+        ("action", "By action"),
+        ("calendar_year", "By year"),
+        ("holding_age", "By holding age"),
+        ("concentration", "By concentration"),
+        ("market_regime", "By deterministic market regime"),
+        ("symbol", "By symbol (n >= 5)"),
+        ("sector", "By sector (n >= 5)"),
+    ):
+        print_patterns(title, [pattern for pattern in meaningful if pattern.dimension == dimension])
+    print_patterns("Insufficient-evidence buckets", insufficient)
+
+    impact_rows = []
+    for horizon in HORIZONS:
+        positive, negative = ranked_impacts(rows, horizon)
+        click.echo(f"\n== {horizon.upper()} largest incremental INR impacts ==")
+        for sign, events in (("positive", positive), ("negative", negative)):
+            for event in events:
+                click.echo(
+                    f"{sign:8s} {event.symbol:12s} {event.decision_at} {event.action:6s} "
+                    f"INR {event.decision_dollar_impact} decision={event.decision_id}"
+                )
+                impact_rows.append((sign, event))
+
+    if csv_out:
+        with open(csv_out, "w", newline="", encoding="utf-8") as output:
+            writer = csv_module.DictWriter(
+                output,
+                fieldnames=[
+                    "record_type", "population", "dimension", "bucket", "horizon", "n", "sample_label",
+                    "median_absolute_return_pct", "median_excess_return_pct", "benchmark_outperformance_rate_pct",
+                    "positive_return_rate_pct", "median_drawdown_pct", "max_drawdown_pct",
+                    "median_decision_dollar_impact", "positive_dollar_impact_rate_pct", "decision_ids",
+                    "impact_sign", "symbol", "decision_at", "action", "decision_dollar_impact",
+                    "decision_id", "hold_decision_id", "historical_trade_evidence",
+                ],
+            )
+            writer.writeheader()
+            for pattern in patterns:
+                stats = pattern.stats
+                writer.writerow({
+                    "record_type": "pattern", "population": pattern.population,
+                    "dimension": pattern.dimension, "bucket": pattern.bucket, "horizon": pattern.horizon,
+                    "n": stats.n, "sample_label": stats.sample_label,
+                    "median_absolute_return_pct": stats.median_absolute_return_pct,
+                    "median_excess_return_pct": stats.median_excess_return_pct,
+                    "benchmark_outperformance_rate_pct": stats.benchmark_outperformance_rate_pct,
+                    "positive_return_rate_pct": stats.positive_return_rate_pct,
+                    "median_drawdown_pct": stats.median_drawdown_pct,
+                    "max_drawdown_pct": stats.max_drawdown_pct,
+                    "median_decision_dollar_impact": stats.median_decision_dollar_impact,
+                    "positive_dollar_impact_rate_pct": stats.positive_dollar_impact_rate_pct,
+                    "decision_ids": ";".join(pattern.decision_ids),
+                })
+            for sign, event in impact_rows:
+                writer.writerow({
+                    "record_type": "impact_event", "horizon": event.horizon, "impact_sign": sign,
+                    "symbol": event.symbol, "decision_at": event.decision_at, "action": event.action,
+                    "decision_dollar_impact": event.decision_dollar_impact, "decision_id": event.decision_id,
+                    "hold_decision_id": event.hold_decision_id,
+                    "historical_trade_evidence": json.dumps(event.trade_evidence),
+                })
+        click.echo(f"\nAudit CSV written to {csv_out}")
+
+
 def main() -> None:
     cli()
 
