@@ -156,3 +156,80 @@ async def freeze_decision(
         )
     )
     return row
+
+
+DETERMINISTIC_BASELINE_VERSION = "deterministic-baseline-v1"
+
+
+async def freeze_deterministic_baseline_decision(
+    session: AsyncSession,
+    *,
+    run: WalkForwardRun,
+    broker_account_id: uuid.UUID,
+    symbol: str,
+    decision_at: date,
+) -> WalkForwardDecision:
+    """Freeze the deliberately conservative Phase 6H offline baseline.
+
+    This is not connected to the live graph.  It uses only the reconstructed
+    state immediately before T: a clean existing position maps to HOLD;
+    missing/ambiguous inputs map to INSUFFICIENT_EVIDENCE.  It deliberately
+    has no initiation, reduction, or exit heuristic because no such
+    deterministic live policy existed historically and inventing one from
+    Phase 6D outcomes would be hindsight tuning.
+    """
+    feature_cutoff_at = datetime.combine(decision_at, datetime.max.time())
+    prior_date = decision_at - timedelta(days=1)
+    snapshot = await get_portfolio_as_of(
+        session,
+        broker_account_id=broker_account_id,
+        as_of_date=prior_date,
+        feature_cutoff_at=feature_cutoff_at,
+    )
+    position = _find_position(snapshot, symbol)
+    quality, warnings = _symbol_data_quality(snapshot, symbol)
+    reason: str
+    if quality != "CLEAN":
+        action: Action = "INSUFFICIENT_EVIDENCE"
+        reason = "reconstructed pre-decision position has unresolved warnings"
+    elif position is None or position.quantity_held <= _ZERO:
+        action = "INSUFFICIENT_EVIDENCE"
+        reason = "no clean pre-decision position; baseline-v1 does not initiate positions"
+    elif position.corporate_action_flag:
+        action = "INSUFFICIENT_EVIDENCE"
+        reason = "pre-decision position has a corporate-action reconstruction flag"
+    else:
+        action = "HOLD"
+        reason = "clean pre-decision position; baseline-v1 preserves it without an unvalidated action rule"
+
+    quantity = position.quantity_held if position else _ZERO
+    average_cost = position.average_cost if position else _ZERO
+    invested = position.invested_capital if position else _ZERO
+    repo = WalkForwardDecisionRepository(session)
+    row, _ = await repo.create_if_not_exists(
+        WalkForwardDecisionCreate(
+            run_id=run.id,
+            broker_account_id=broker_account_id,
+            company_id=position.company_id if position else None,
+            symbol=symbol,
+            decision_at=decision_at,
+            feature_cutoff_at=feature_cutoff_at,
+            decision_source="AGENT",
+            action=action,
+            confidence=None,
+            reasoning=f"{DETERMINISTIC_BASELINE_VERSION}: {reason}.",
+            evidence=[{
+                "type": "deterministic_baseline",
+                "version": DETERMINISTIC_BASELINE_VERSION,
+                "as_of_date": str(prior_date),
+                "prior_quantity": str(quantity),
+                "reason": reason,
+            }],
+            quantity_held=quantity,
+            average_cost=average_cost,
+            invested_capital=invested,
+            reconstruction_warnings=warnings,
+            data_quality_status=quality,
+        )
+    )
+    return row

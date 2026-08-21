@@ -1927,7 +1927,7 @@ class WalkForwardDecision(Base):
     # ACTUAL | HOLD_BASELINE | AGENT
     decision_source: Mapped[str] = mapped_column(String(20), nullable=False)
     # BUY | ADD | HOLD | REDUCE | EXIT
-    action: Mapped[str] = mapped_column(String(10), nullable=False)
+    action: Mapped[str] = mapped_column(String(30), nullable=False)
     # Only meaningful for decision_source=AGENT; None for ACTUAL/HOLD_BASELINE.
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     reasoning: Mapped[str | None] = mapped_column(Text)

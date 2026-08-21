@@ -17,7 +17,10 @@ from typing import Any, Literal
 from investing_agent.schemas.common import BaseSchema
 
 DecisionSource = Literal["ACTUAL", "HOLD_BASELINE", "AGENT"]
-Action = Literal["BUY", "ADD", "HOLD", "REDUCE", "EXIT"]
+# INSUFFICIENT_EVIDENCE is valid only for the offline AGENT comparator.  It
+# records that a policy declined to manufacture an action from missing PIT
+# inputs; it is never interpreted as a trade.
+Action = Literal["BUY", "ADD", "HOLD", "REDUCE", "EXIT", "INSUFFICIENT_EVIDENCE"]
 DataQualityStatus = Literal["CLEAN", "RECONSTRUCTION_WARNING"]
 OutcomeStatus = Literal["SCORED", "PARTIAL", "UNSCORABLE"]
 

@@ -3308,6 +3308,77 @@ async def _candidate_policy_run(
     click.echo("\nCandidates recorded for manual review only; none are active in recommendations.")
 
 
+@cli.command("historical-agent-comparator-run")
+@click.option("--run-id", required=True, help="Existing frozen Phase 6D WalkForwardRun UUID")
+def historical_agent_comparator_run_cmd(run_id: str) -> None:
+    """Replay deterministic-baseline-v1 offline at existing Phase 6D points."""
+    asyncio.run(_historical_agent_comparator_run(run_id))
+
+
+async def _historical_agent_comparator_run(run_id: str) -> None:
+    import uuid as uuid_module
+
+    from investing_agent.db.repositories.walkforward import WalkForwardRunRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.walkforward.runner import replay_deterministic_baseline
+
+    async with AsyncSessionLocal() as session:
+        run = await WalkForwardRunRepository(session).get(uuid_module.UUID(run_id))
+        if run is None:
+            click.echo(f"ERROR: no WalkForwardRun with id={run_id}", err=True)
+            sys.exit(1)
+        result = await replay_deterministic_baseline(session, run=run)
+        await session.commit()
+    click.echo(
+        f"Replayed deterministic-baseline-v1 for {len(result.entries)} historical points; "
+        "offline only, no live recommendations changed."
+    )
+
+
+@cli.command("historical-agent-comparator-report")
+@click.option("--run-id", required=True, help="Phase 6D run with AGENT comparator rows")
+def historical_agent_comparator_report_cmd(run_id: str) -> None:
+    """Compare deterministic-baseline-v1 with actual decisions and HOLD."""
+    asyncio.run(_historical_agent_comparator_report(run_id))
+
+
+async def _historical_agent_comparator_report(run_id: str) -> None:
+    import uuid as uuid_module
+
+    from investing_agent.db.repositories.walkforward import (
+        WalkForwardDecisionRepository,
+        WalkForwardOutcomeRepository,
+        WalkForwardRunRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.walkforward.comparator import build_comparator_report
+    from investing_agent.services.walkforward.runner import WalkForwardEntry
+
+    async with AsyncSessionLocal() as session:
+        run = await WalkForwardRunRepository(session).get(uuid_module.UUID(run_id))
+        if run is None:
+            click.echo(f"ERROR: no WalkForwardRun with id={run_id}", err=True)
+            sys.exit(1)
+        decisions = await WalkForwardDecisionRepository(session).list_for_run(run.id)
+        outcome_repo = WalkForwardOutcomeRepository(session)
+        entries = [
+            WalkForwardEntry(decision=d, outcome=o)
+            for d in decisions
+            if (o := await outcome_repo.get_by_decision_id(d.id)) is not None
+        ]
+    report = build_comparator_report(entries)
+    click.echo("\nHistorical deterministic-agent comparator — deterministic-baseline-v1 (offline only)")
+    click.echo(f"events={report['events']} policy_scoreable={report['policy_scoreable']} policy_unscoreable={report['policy_unscoreable']}")
+    click.echo("action distribution: " + ", ".join(f"{k}={v}" for k, v in report["action_distribution"].items()))
+    for horizon, values in report["by_horizon"].items():
+        click.echo(
+            f"{horizon.upper()}: outcome scoreable/unscoreable={values['outcome_scoreable']}/{values['outcome_unscoreable']} "
+            f"eligible={values['baseline_eligible']} median_return={values['median_stock_return_pct']}% "
+            f"median_excess_TRI={values['median_excess_tri_pct']}% median_drawdown={values['median_drawdown_pct']}% "
+            f"agent_vs_HOLD_INR={values['median_agent_vs_hold_impact_inr']} actual_vs_HOLD_INR={values['median_actual_vs_hold_impact_inr']}"
+        )
+
+
 @cli.command("policy-proposal-report")
 @click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
 @click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))

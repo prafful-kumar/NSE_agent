@@ -21,7 +21,7 @@ from investing_agent.db.repositories.broker_history import BrokerAccountReposito
 from investing_agent.db.repositories.walkforward import WalkForwardRunRepository
 from investing_agent.schemas.walkforward import WalkForwardRunCreate
 from investing_agent.services.walkforward.bulk import generate_decision_points
-from investing_agent.services.walkforward.decisions import freeze_decision
+from investing_agent.services.walkforward.decisions import freeze_decision, freeze_deterministic_baseline_decision
 from investing_agent.services.walkforward.outcomes import score_outcome
 
 DEFAULT_HORIZONS_MONTHS = (1, 3, 6, 12)
@@ -98,3 +98,29 @@ async def run_bulk_walk_forward(
         horizons_months=horizons_months,
         model_version=model_version,
     )
+
+
+async def replay_deterministic_baseline(
+    session: AsyncSession, *, run: WalkForwardRun
+) -> WalkForwardRunResult:
+    """Add offline AGENT comparator decisions to an existing frozen run.
+
+    The source points come only from already-frozen ACTUAL events; no outcome
+    fields are read before the baseline decision is made.
+    """
+    from investing_agent.db.repositories.walkforward import WalkForwardDecisionRepository
+
+    decisions = await WalkForwardDecisionRepository(session).list_for_run(run.id)
+    actuals = [d for d in decisions if d.decision_source == "ACTUAL"]
+    result = WalkForwardRunResult(run=run)
+    for actual in actuals:
+        agent = await freeze_deterministic_baseline_decision(
+            session,
+            run=run,
+            broker_account_id=run.broker_account_id,
+            symbol=actual.symbol,
+            decision_at=actual.decision_at,
+        )
+        outcome = await score_outcome(session, decision=agent)
+        result.entries.append(WalkForwardEntry(decision=agent, outcome=outcome))
+    return result
