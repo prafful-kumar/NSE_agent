@@ -2008,3 +2008,55 @@ class WalkForwardOutcome(Base):
     evaluated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+# ── Governed personal policy adaptation (Phase 6F) ───────────────────────────
+
+class CandidatePolicyRule(TimestampMixin, Base):
+    """A human-governed policy candidate derived from Phase 6E patterns.
+
+    This record is deliberately not referenced by the agent graph. APPROVED
+    means reviewed for a future bounded policy layer; it does not enable the
+    rule or change a recommendation.
+    """
+
+    __tablename__ = "candidate_policy_rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id"), index=True, nullable=False
+    )
+    rule_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    strategy_profile: Mapped[str] = mapped_column(String(20), nullable=False)
+    feature_condition: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    affected_action: Mapped[str] = mapped_column(String(20), nullable=False)
+    proposed_adjustment: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    evidence_window: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    sample_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    supporting_metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    # PROPOSED | BACKTESTED | REJECTED | APPROVED. Never auto-APPROVED.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PROPOSED", index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PolicyProposal(TimestampMixin, Base):
+    """Human-readable review artifact for one CandidatePolicyRule."""
+
+    __tablename__ = "policy_proposals"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    candidate_rule_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("candidate_policy_rules.id"), unique=True, nullable=False
+    )
+    current_behavior: Mapped[str] = mapped_column(Text, nullable=False)
+    historical_evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_adjustment: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_benefit: Mapped[str] = mapped_column(Text, nullable=False)
+    known_risks: Mapped[str] = mapped_column(Text, nullable=False)
+    out_of_sample_result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)  # APPROVE | REJECT

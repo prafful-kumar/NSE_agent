@@ -3139,6 +3139,197 @@ async def _personal_policy_report(
         click.echo(f"\nAudit CSV written to {csv_out}")
 
 
+@cli.command("candidate-policy-run")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+@click.option("--run-id", required=True, help="Frozen Phase 6D WalkForwardRun UUID")
+def candidate_policy_run_cmd(
+    user_id: str | None, broker: str, account_label: str, run_id: str
+) -> None:
+    """Build and validate Phase 6F candidates; never enables a live rule."""
+    asyncio.run(_candidate_policy_run(user_id, broker, account_label, run_id))
+
+
+async def _candidate_policy_run(
+    user_id: str | None, broker: str, account_label: str, run_id: str
+) -> None:
+    import uuid as uuid_module
+
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.repositories.policy import (
+        CandidatePolicyRuleRepository,
+        PolicyProposalRepository,
+    )
+    from investing_agent.db.repositories.walkforward import (
+        WalkForwardDecisionRepository,
+        WalkForwardOutcomeRepository,
+        WalkForwardRunRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.policy import CandidatePolicyRuleCreate, PolicyProposalCreate
+    from investing_agent.services.governed_policy import (
+        candidate_specs,
+        metrics_as_dict,
+        validate_expanding,
+    )
+    from investing_agent.services.walkforward.audit import build_audit_rows
+    from investing_agent.services.walkforward.runner import WalkForwardEntry
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+    async with AsyncSessionLocal() as session:
+        account = await BrokerAccountRepository(session).get_by_label(
+            resolved_user_id, broker, account_label
+        )
+        run = await WalkForwardRunRepository(session).get(uuid_module.UUID(run_id))
+        if account is None or run is None or run.broker_account_id != account.id:
+            click.echo("ERROR: run does not belong to the specified broker account.", err=True)
+            sys.exit(1)
+        decisions = await WalkForwardDecisionRepository(session).list_for_run(run.id)
+        outcome_repo = WalkForwardOutcomeRepository(session)
+        entries = []
+        for decision in decisions:
+            outcome = await outcome_repo.get_by_decision_id(decision.id)
+            if outcome is not None:
+                entries.append(WalkForwardEntry(decision=decision, outcome=outcome))
+        rows = await build_audit_rows(session, broker_account_id=account.id, entries=entries)
+        rule_repo = CandidatePolicyRuleRepository(session)
+        proposal_repo = PolicyProposalRepository(session)
+        for spec in candidate_specs():
+            evaluation = validate_expanding(rows, spec)
+            persisted_rule_id = f"{account.id}:{spec.rule_id}"
+            rule = await rule_repo.create_or_replace_draft(CandidatePolicyRuleCreate(
+                broker_account_id=account.id,
+                rule_id=persisted_rule_id,
+                strategy_profile=run.strategy_profile,
+                feature_condition=spec.condition,
+                affected_action=spec.affected_action,
+                proposed_adjustment=spec.adjustment,
+                evidence_window={"run_id": str(run.id), "horizon": "12m", "validation": "expanding_yearly"},
+                sample_size=evaluation.full_history.n,
+                supporting_metrics={
+                    "full_history": metrics_as_dict(evaluation.full_history),
+                    "excluding_2020": metrics_as_dict(evaluation.excluding_2020),
+                    "folds": [
+                        {"train_end_year": fold.train_end_year, "validation_year": fold.validation_year,
+                         "train": metrics_as_dict(fold.train), "validation": metrics_as_dict(fold.validation)}
+                        for fold in evaluation.folds
+                    ],
+                    "rejection_reasons": list(evaluation.rejection_reasons),
+                    "complexity": spec.complexity,
+                },
+                confidence=evaluation.confidence,
+                status=evaluation.status,
+            ))
+            proposal_decision = "APPROVE" if evaluation.status == "BACKTESTED" else "REJECT"
+            await proposal_repo.create_or_replace(PolicyProposalCreate(
+                candidate_rule_id=rule.id,
+                current_behavior="Base actions remain the frozen Phase 6D ACTUAL decisions; no live policy layer exists.",
+                historical_evidence=(
+                    f"n={evaluation.full_history.n}; 12M median excess="
+                    f"{evaluation.full_history.median_excess_return_pct}%; "
+                    f"excluding 2020={evaluation.excluding_2020.median_excess_return_pct}%."
+                ),
+                proposed_adjustment=str(spec.adjustment),
+                expected_benefit=(
+                    "Candidate cohort is compared with actual incremental INR impact and the zero-impact HOLD baseline; "
+                    "no frozen deterministic-agent comparator is available."
+                ),
+                known_risks="; ".join(evaluation.rejection_reasons) or "Requires explicit human approval; never overrides hard risk controls.",
+                out_of_sample_result={
+                    "status": evaluation.status,
+                    "folds": [
+                        {"validation_year": fold.validation_year, "validation": metrics_as_dict(fold.validation)}
+                        for fold in evaluation.folds
+                    ],
+                },
+                decision=proposal_decision,
+            ))
+            click.echo(
+                f"{spec.rule_id}: {evaluation.status} n={evaluation.full_history.n} "
+                f"reasons={'; '.join(evaluation.rejection_reasons) or 'eligible for human review'}"
+            )
+        await session.commit()
+
+    click.echo("\nCandidates recorded for manual review only; none are active in recommendations.")
+
+
+@cli.command("policy-proposal-report")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+def policy_proposal_report_cmd(user_id: str | None, broker: str, account_label: str) -> None:
+    """Print candidate-rule evidence and human review recommendations."""
+    asyncio.run(_policy_proposal_report(user_id, broker, account_label))
+
+
+async def _policy_proposal_report(user_id: str | None, broker: str, account_label: str) -> None:
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.repositories.policy import (
+        CandidatePolicyRuleRepository,
+        PolicyProposalRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+    async with AsyncSessionLocal() as session:
+        account = await BrokerAccountRepository(session).get_by_label(
+            resolved_user_id, broker, account_label
+        )
+        if account is None:
+            click.echo(f"ERROR: no {broker}/{account_label} account for user={resolved_user_id}.", err=True)
+            sys.exit(1)
+        rules = await CandidatePolicyRuleRepository(session).list_for_account(account.id)
+        proposal_repo = PolicyProposalRepository(session)
+        proposals = [(rule, await proposal_repo.get_by_candidate_rule_id(rule.id)) for rule in rules]
+
+    if not proposals:
+        click.echo("No Phase 6F candidates. Run candidate-policy-run first.")
+        return
+    click.echo("\nGoverned personal policy proposals — review only; no rule is live-enabled.")
+    for rule, proposal in proposals:
+        click.echo(f"\n== {rule.rule_id} [{rule.status}] ==")
+        click.echo(f"Condition: {rule.feature_condition}")
+        click.echo(f"Adjustment: {rule.proposed_adjustment}")
+        click.echo(f"n={rule.sample_size} confidence={rule.confidence}")
+        if proposal is not None:
+            click.echo(f"Current behavior: {proposal.current_behavior}")
+            click.echo(f"Historical evidence: {proposal.historical_evidence}")
+            click.echo(f"Expected benefit: {proposal.expected_benefit}")
+            click.echo(f"Known risks: {proposal.known_risks}")
+            click.echo(f"Out-of-sample: {proposal.out_of_sample_result}")
+            click.echo(f"Review decision: {proposal.decision}")
+
+
+@cli.command("policy-rule-review")
+@click.argument("rule_id")
+@click.option("--approve/--reject", default=False, help="Explicit human review decision; does not enable the rule")
+def policy_rule_review_cmd(rule_id: str, approve: bool) -> None:
+    """Record human approval/rejection without integrating any live policy."""
+    asyncio.run(_policy_rule_review(rule_id, approve))
+
+
+async def _policy_rule_review(rule_id: str, approve: bool) -> None:
+    from investing_agent.db.repositories.policy import CandidatePolicyRuleRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        repo = CandidatePolicyRuleRepository(session)
+        rule = await repo.get_by_rule_id(rule_id)
+        if rule is None:
+            click.echo(f"ERROR: candidate rule {rule_id!r} not found.", err=True)
+            sys.exit(1)
+        # A rejected backtest may never be approved without a new backtest.
+        if approve and rule.status == "REJECTED":
+            click.echo("ERROR: rejected candidates require a new validated backtest before approval.", err=True)
+            sys.exit(1)
+        await repo.set_status(rule, "APPROVED" if approve else "REJECTED")
+        await session.commit()
+    click.echo(f"{rule_id}: {'APPROVED' if approve else 'REJECTED'} (still not live-enabled)")
+
+
 def main() -> None:
     cli()
 
