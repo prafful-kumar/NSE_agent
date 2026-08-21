@@ -65,6 +65,7 @@ class PersonalDecisionPattern:
     dimension: str
     bucket: str
     horizon: str
+    benchmark_kind: str
     stats: PersonalPolicyStats
     decision_ids: tuple[str, ...]
 
@@ -99,16 +100,23 @@ def _rate(values: Sequence[Decimal], predicate: Callable[[Decimal], bool]) -> De
     return Decimal(sum(predicate(value) for value in values)) * 100 / Decimal(len(values))
 
 
-def _stats(rows: Sequence[AuditRow], horizon: str) -> PersonalPolicyStats:
+def _stats(
+    rows: Sequence[AuditRow], horizon: str, benchmark_kind: str
+) -> PersonalPolicyStats:
     # Excluded Phase 6D events are never treated as learning evidence.
     scored = [
         row for row in rows if row.included_in_aggregate and row.stock_return[horizon] is not None
     ]
     returns = [row.stock_return[horizon] for row in scored]
+    excess_source = (
+        (lambda row: row.excess_return_tri.get(horizon))
+        if benchmark_kind == "TRI"
+        else (lambda row: row.excess_return[horizon])
+    )
     excess = [
-        row.excess_return[horizon]
+        excess_source(row)
         for row in scored
-        if row.excess_return[horizon] is not None
+        if excess_source(row) is not None
     ]
     drawdowns = [row.max_drawdown_pct for row in scored if row.max_drawdown_pct is not None]
     impacts = [
@@ -169,6 +177,7 @@ def build_patterns(
     *,
     sectors_by_symbol: dict[str, str | None],
     regimes_by_decision_id: dict[str, str],
+    benchmark_kind: str = "PRICE_INDEX",
 ) -> list[PersonalDecisionPattern]:
     """Build full-history, excluding-2020, and dimension-specific patterns."""
     dimensions: tuple[tuple[str, Callable[[AuditRow], str]], ...] = (
@@ -193,7 +202,7 @@ def build_patterns(
                 groups[key_fn(row)].append(row)
             for bucket, group in sorted(groups.items()):
                 for horizon in HORIZONS:
-                    stats = _stats(group, horizon)
+                    stats = _stats(group, horizon, benchmark_kind)
                     # Stock/sector patterns only exist when enough events are
                     # scored; all other small buckets remain visible as such.
                     if dimension in {"symbol", "sector"} and stats.n < 5:
@@ -203,6 +212,7 @@ def build_patterns(
                         dimension=dimension,
                         bucket=bucket,
                         horizon=horizon,
+                        benchmark_kind=benchmark_kind,
                         stats=stats,
                         decision_ids=tuple(str(row.decision_id) for row in group),
                     ))

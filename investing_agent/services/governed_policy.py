@@ -55,6 +55,7 @@ class ValidationFold:
 @dataclass(frozen=True)
 class CandidateEvaluation:
     spec: CandidateSpec
+    benchmark_kind: str
     full_history: Metrics
     excluding_2020: Metrics
     folds: tuple[ValidationFold, ...]
@@ -104,7 +105,7 @@ def _pct(values: Sequence[Decimal], predicate: Callable[[Decimal], bool]) -> Dec
     return Decimal(sum(predicate(value) for value in values)) * 100 / Decimal(len(values))
 
 
-def summarize(rows: Sequence[AuditRow], spec: CandidateSpec) -> Metrics:
+def summarize(rows: Sequence[AuditRow], spec: CandidateSpec, benchmark_kind: str = "PRICE_INDEX") -> Metrics:
     """Actual-decision outcomes for a candidate's pre-declared cohort.
 
     HOLD is the counterfactual already represented by decision_dollar_impact:
@@ -116,12 +117,22 @@ def summarize(rows: Sequence[AuditRow], spec: CandidateSpec) -> Metrics:
         row for row in rows
         if row.included_in_aggregate and spec.matches(row) and row.stock_return[HORIZON] is not None
     ]
-    excess = [row.excess_return[HORIZON] for row in matched if row.excess_return[HORIZON] is not None]
+    excess_source = (
+        (lambda row: row.excess_return_tri.get(HORIZON))
+        if benchmark_kind == "TRI"
+        else (lambda row: row.excess_return[HORIZON])
+    )
+    benchmark_source = (
+        (lambda row: row.benchmark_tri_return.get(HORIZON))
+        if benchmark_kind == "TRI"
+        else (lambda row: row.benchmark_return[HORIZON])
+    )
+    excess = [excess_source(row) for row in matched if excess_source(row) is not None]
     returns = [row.stock_return[HORIZON] for row in matched if row.stock_return[HORIZON] is not None]
     benchmark = [
-        row.benchmark_return[HORIZON]
+        benchmark_source(row)
         for row in matched
-        if row.benchmark_return[HORIZON] is not None
+        if benchmark_source(row) is not None
     ]
     impacts = [impact for row in matched if (impact := decision_dollar_impact(row, HORIZON)) is not None]
     drawdowns = [row.max_drawdown_pct for row in matched if row.max_drawdown_pct is not None]
@@ -146,10 +157,14 @@ def summarize(rows: Sequence[AuditRow], spec: CandidateSpec) -> Metrics:
     )
 
 
-def validate_expanding(rows: Sequence[AuditRow], spec: CandidateSpec) -> CandidateEvaluation:
+def validate_expanding(
+    rows: Sequence[AuditRow], spec: CandidateSpec, benchmark_kind: str = "PRICE_INDEX"
+) -> CandidateEvaluation:
     """Use only earlier years to form a candidate and later years to test it."""
-    full_history = summarize(rows, spec)
-    excluding_2020 = summarize([row for row in rows if row.calendar_year != 2020], spec)
+    full_history = summarize(rows, spec, benchmark_kind)
+    excluding_2020 = summarize(
+        [row for row in rows if row.calendar_year != 2020], spec, benchmark_kind
+    )
     years = sorted({row.calendar_year for row in rows})
     folds: list[ValidationFold] = []
     for validation_year in years:
@@ -160,8 +175,8 @@ def validate_expanding(rows: Sequence[AuditRow], spec: CandidateSpec) -> Candida
         folds.append(ValidationFold(
             train_end_year=validation_year - 1,
             validation_year=validation_year,
-            train=summarize(train, spec),
-            validation=summarize(validation, spec),
+            train=summarize(train, spec, benchmark_kind),
+            validation=summarize(validation, spec, benchmark_kind),
         ))
 
     reasons: list[str] = []
@@ -199,6 +214,7 @@ def validate_expanding(rows: Sequence[AuditRow], spec: CandidateSpec) -> Candida
     confidence = min(Decimal("0.90"), Decimal(full_history.n) / Decimal(100)) if status == "BACKTESTED" else None
     return CandidateEvaluation(
         spec=spec,
+        benchmark_kind=benchmark_kind,
         full_history=full_history,
         excluding_2020=excluding_2020,
         folds=tuple(folds),

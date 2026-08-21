@@ -4,6 +4,7 @@ from __future__ import annotations
 functions (no DB access -- AuditRow instances built directly)."""
 
 import uuid
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
@@ -133,6 +134,13 @@ class TestSummarizeHorizon:
         assert summary["n_scored_this_horizon"] == 0
         assert summary["median_stock_return_pct"] is None
         assert summary["positive_return_rate_pct"] is None
+
+    def test_tri_comparison_uses_tri_excess_not_price_index_excess(self):
+        row = _row(stock_1m=Decimal("0.10"), excess_1m=Decimal("0.05"))
+        tri_row = replace(row, excess_return_tri={"1m": Decimal("-0.02")})
+        summary = summarize_horizon([tri_row], "1m", "TRI")
+        assert summary["median_excess_return_pct"] == Decimal("-2")
+        assert summary["benchmark_outperform_rate_pct"] == Decimal("0")
 
     def test_decision_dollar_impact_uses_quantity_delta_not_return_delta(self):
         # A BUY: HOLD_BASELINE quantity is 0 (no prior position), ACTUAL

@@ -84,6 +84,8 @@ class AuditRow:
     included_in_aggregate: bool
     exclusion_reason: str | None
     trade_evidence: list[dict[str, Any]] = field(default_factory=list)
+    benchmark_tri_return: dict[str, Decimal | None] = field(default_factory=dict)
+    excess_return_tri: dict[str, Decimal | None] = field(default_factory=dict)
 
 
 def _horizon_dict(outcome, prefix: str) -> dict[str, Decimal | None]:
@@ -163,6 +165,8 @@ async def build_audit_rows(
                 stock_return=_horizon_dict(o, "stock_return"),
                 benchmark_return=_horizon_dict(o, "benchmark_return"),
                 excess_return=_horizon_dict(o, "excess_return"),
+                benchmark_tri_return=_horizon_dict(o, "benchmark_tri_return"),
+                excess_return_tri=_horizon_dict(o, "excess_return_tri"),
                 hold_stock_return=_horizon_dict(hold_o, "stock_return"),
                 max_drawdown_pct=o.max_drawdown_pct,
                 data_quality_notes=o.data_quality_notes,

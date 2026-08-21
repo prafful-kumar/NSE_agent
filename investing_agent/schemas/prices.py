@@ -16,8 +16,13 @@ from typing import Literal
 
 from investing_agent.schemas.common import BaseSchema, TimestampedSchema
 
-PriceDataType = Literal["EQUITY_BHAVCOPY", "INDEX_BHAVCOPY"]
-PriceSourceFormat = Literal["NSE_CM_UDIFF", "NSE_CM_LEGACY", "NSE_INDICES_CLOSE_ALL"]
+PriceDataType = Literal["EQUITY_BHAVCOPY", "INDEX_BHAVCOPY", "INDEX_TOTAL_RETURN"]
+PriceSourceFormat = Literal[
+    "NSE_CM_UDIFF",
+    "NSE_CM_LEGACY",
+    "NSE_INDICES_CLOSE_ALL",
+    "NIFTY_INDICES_TOTAL_RETURN",
+]
 AdjustmentStatus = Literal["RAW"]
 
 

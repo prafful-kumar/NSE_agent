@@ -2552,7 +2552,7 @@ async def _sync_daily_prices(symbol: str, start_date, end_date) -> None:
 
 
 @cli.command("sync-benchmark-prices")
-@click.option("--benchmark-code", required=True, type=click.Choice(["NIFTY_50"]))
+@click.option("--benchmark-code", required=True, type=click.Choice(["NIFTY_50", "NIFTY_50_TRI"]))
 @click.option("--start-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
 @click.option("--end-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
 def sync_benchmark_prices_cmd(
@@ -2567,8 +2567,13 @@ async def _sync_benchmark_prices(benchmark_code: str, start_date, end_date) -> N
     from investing_agent.db.session import AsyncSessionLocal
     from investing_agent.services.prices.ingestion import sync_benchmark_prices
     from investing_agent.services.prices.nse_indices import NSEIndicesBenchmarkPriceProvider
+    from investing_agent.services.prices.nifty_tri import NiftyIndicesTRIBenchmarkPriceProvider
 
-    provider = NSEIndicesBenchmarkPriceProvider(benchmark_code)
+    provider = (
+        NiftyIndicesTRIBenchmarkPriceProvider()
+        if benchmark_code == "NIFTY_50_TRI"
+        else NSEIndicesBenchmarkPriceProvider(benchmark_code)
+    )
     try:
         async with AsyncSessionLocal() as session:
             summary = await sync_benchmark_prices(
@@ -2779,12 +2784,48 @@ async def _walk_forward_show(run_id: str) -> None:
                     stock_r = getattr(o, f"stock_return_{h}")
                     bench_r = getattr(o, f"benchmark_return_{h}")
                     excess_r = getattr(o, f"excess_return_{h}")
+                    tri_r = getattr(o, f"benchmark_tri_return_{h}", None)
+                    tri_excess_r = getattr(o, f"excess_return_tri_{h}", None)
                     click.echo(
-                        f"    {h.upper():>4s}: stock={stock_r}  nifty={bench_r}  excess={excess_r}"
+                        f"    {h.upper():>4s}: stock={stock_r}  nifty_price={bench_r}  "
+                        f"excess_price={excess_r}  nifty_tri={tri_r}  excess_tri={tri_excess_r}"
                     )
                 if o.data_quality_notes:
                     for note in o.data_quality_notes:
                         click.echo(f"    note: {note}")
+
+
+@cli.command("backfill-walk-forward-tri")
+@click.option("--run-id", required=True, help="WalkForwardRun UUID")
+def backfill_walk_forward_tri_cmd(run_id: str) -> None:
+    """Add NIFTY 50 TRI returns to existing frozen outcomes.
+
+    This only populates the additive Phase 6G TRI columns. It never changes a
+    frozen decision, price-index return, outcome status, or recommendation.
+    """
+    asyncio.run(_backfill_walk_forward_tri(run_id))
+
+
+async def _backfill_walk_forward_tri(run_id: str) -> None:
+    import uuid as uuid_module
+
+    from investing_agent.db.repositories.walkforward import (
+        WalkForwardDecisionRepository,
+        WalkForwardRunRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.walkforward.outcomes import score_outcome
+
+    async with AsyncSessionLocal() as session:
+        run = await WalkForwardRunRepository(session).get(uuid_module.UUID(run_id))
+        if run is None:
+            click.echo(f"ERROR: no WalkForwardRun with id={run_id}", err=True)
+            sys.exit(1)
+        decisions = await WalkForwardDecisionRepository(session).list_for_run(run.id)
+        for decision in decisions:
+            await score_outcome(session, decision=decision)
+        await session.commit()
+    click.echo(f"Backfilled NIFTY_50_TRI returns for {len(decisions)} frozen decisions in run {run_id}.")
 
 
 @cli.command("walk-forward-bulk-run")
@@ -2933,6 +2974,7 @@ async def _walk_forward_report(run_id: str, csv_out: str | None) -> None:
 
     for horizon in ("1m", "3m", "6m", "12m"):
         h = report["by_horizon"][horizon]
+        tri_h = report["by_horizon_tri"][horizon]
         click.echo(f"\n== {horizon.upper()} ==")
         o = h["overall"]
         click.echo(
@@ -2948,6 +2990,12 @@ async def _walk_forward_report(run_id: str, csv_out: str | None) -> None:
         _print_bucket_group("by year", h["by_year"])
         _print_bucket_group("by holding age", h["by_holding_age"])
         _print_bucket_group("by concentration", h["by_concentration"])
+        tri_overall = tri_h["overall"]
+        click.echo(
+            f"  NIFTY 50 TRI comparison: n_scored={tri_overall['n_scored_this_horizon']} "
+            f"median_excess={tri_overall['median_excess_return_pct']}% "
+            f"outperform_rate={tri_overall['benchmark_outperform_rate_pct']}%"
+        )
 
     if csv_out:
         with open(csv_out, "w", newline="") as f:
@@ -2988,12 +3036,13 @@ async def _walk_forward_report(run_id: str, csv_out: str | None) -> None:
 @click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
 @click.option("--account-label", required=True, help="Broker account label")
 @click.option("--run-id", default=None, help="Phase 6D run UUID; defaults to the newest account run")
+@click.option("--benchmark", default="PRICE_INDEX", type=click.Choice(["PRICE_INDEX", "TRI"]))
 @click.option("--csv-out", default=None, type=click.Path(dir_okay=False), help="Write patterns and high-impact event traces to CSV")
 def personal_policy_report_cmd(
-    user_id: str | None, broker: str, account_label: str, run_id: str | None, csv_out: str | None
+    user_id: str | None, broker: str, account_label: str, run_id: str | None, benchmark: str, csv_out: str | None
 ) -> None:
     """Phase 6E descriptive learning from a frozen Phase 6D run only."""
-    asyncio.run(_personal_policy_report(user_id, broker, account_label, run_id, csv_out))
+    asyncio.run(_personal_policy_report(user_id, broker, account_label, run_id, benchmark, csv_out))
 
 
 async def _personal_policy_report(
@@ -3001,6 +3050,7 @@ async def _personal_policy_report(
     broker: str,
     account_label: str,
     run_id: str | None,
+    benchmark: str,
     csv_out: str | None,
 ) -> None:
     import csv as csv_module
@@ -3057,10 +3107,12 @@ async def _personal_policy_report(
         click.echo("No Phase 6D decisions/outcomes found for this run.")
         return
 
-    patterns = build_patterns(rows, sectors_by_symbol=sectors, regimes_by_decision_id=regimes)
+    patterns = build_patterns(
+        rows, sectors_by_symbol=sectors, regimes_by_decision_id=regimes, benchmark_kind=benchmark
+    )
     meaningful = [pattern for pattern in patterns if pattern.stats.sample_label != "INSUFFICIENT_EVIDENCE"]
     insufficient = [pattern for pattern in patterns if pattern.stats.sample_label == "INSUFFICIENT_EVIDENCE"]
-    click.echo(f"\nPersonal policy report — run={run.id}, events={len(rows)}")
+    click.echo(f"\nPersonal policy report — run={run.id}, benchmark={benchmark}, events={len(rows)}")
     click.echo("Descriptive historical learning only; recommendations and decision rules are unchanged.")
 
     def print_patterns(title: str, values) -> None:
@@ -3103,7 +3155,7 @@ async def _personal_policy_report(
             writer = csv_module.DictWriter(
                 output,
                 fieldnames=[
-                    "record_type", "population", "dimension", "bucket", "horizon", "n", "sample_label",
+                    "record_type", "benchmark", "population", "dimension", "bucket", "horizon", "n", "sample_label",
                     "median_absolute_return_pct", "median_excess_return_pct", "benchmark_outperformance_rate_pct",
                     "positive_return_rate_pct", "median_drawdown_pct", "max_drawdown_pct",
                     "median_decision_dollar_impact", "positive_dollar_impact_rate_pct", "decision_ids",
@@ -3115,7 +3167,7 @@ async def _personal_policy_report(
             for pattern in patterns:
                 stats = pattern.stats
                 writer.writerow({
-                    "record_type": "pattern", "population": pattern.population,
+                    "record_type": "pattern", "benchmark": pattern.benchmark_kind, "population": pattern.population,
                     "dimension": pattern.dimension, "bucket": pattern.bucket, "horizon": pattern.horizon,
                     "n": stats.n, "sample_label": stats.sample_label,
                     "median_absolute_return_pct": stats.median_absolute_return_pct,
@@ -3130,7 +3182,7 @@ async def _personal_policy_report(
                 })
             for sign, event in impact_rows:
                 writer.writerow({
-                    "record_type": "impact_event", "horizon": event.horizon, "impact_sign": sign,
+                    "record_type": "impact_event", "benchmark": benchmark, "horizon": event.horizon, "impact_sign": sign,
                     "symbol": event.symbol, "decision_at": event.decision_at, "action": event.action,
                     "decision_dollar_impact": event.decision_dollar_impact, "decision_id": event.decision_id,
                     "hold_decision_id": event.hold_decision_id,
@@ -3144,15 +3196,16 @@ async def _personal_policy_report(
 @click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
 @click.option("--account-label", required=True)
 @click.option("--run-id", required=True, help="Frozen Phase 6D WalkForwardRun UUID")
+@click.option("--benchmark", default="PRICE_INDEX", type=click.Choice(["PRICE_INDEX", "TRI"]))
 def candidate_policy_run_cmd(
-    user_id: str | None, broker: str, account_label: str, run_id: str
+    user_id: str | None, broker: str, account_label: str, run_id: str, benchmark: str
 ) -> None:
     """Build and validate Phase 6F candidates; never enables a live rule."""
-    asyncio.run(_candidate_policy_run(user_id, broker, account_label, run_id))
+    asyncio.run(_candidate_policy_run(user_id, broker, account_label, run_id, benchmark))
 
 
 async def _candidate_policy_run(
-    user_id: str | None, broker: str, account_label: str, run_id: str
+    user_id: str | None, broker: str, account_label: str, run_id: str, benchmark: str
 ) -> None:
     import uuid as uuid_module
 
@@ -3197,8 +3250,8 @@ async def _candidate_policy_run(
         rule_repo = CandidatePolicyRuleRepository(session)
         proposal_repo = PolicyProposalRepository(session)
         for spec in candidate_specs():
-            evaluation = validate_expanding(rows, spec)
-            persisted_rule_id = f"{account.id}:{spec.rule_id}"
+            evaluation = validate_expanding(rows, spec, benchmark)
+            persisted_rule_id = f"{account.id}:{benchmark}:{spec.rule_id}"
             rule = await rule_repo.create_or_replace_draft(CandidatePolicyRuleCreate(
                 broker_account_id=account.id,
                 rule_id=persisted_rule_id,
@@ -3206,7 +3259,7 @@ async def _candidate_policy_run(
                 feature_condition=spec.condition,
                 affected_action=spec.affected_action,
                 proposed_adjustment=spec.adjustment,
-                evidence_window={"run_id": str(run.id), "horizon": "12m", "validation": "expanding_yearly"},
+                evidence_window={"run_id": str(run.id), "horizon": "12m", "benchmark": benchmark, "validation": "expanding_yearly"},
                 sample_size=evaluation.full_history.n,
                 supporting_metrics={
                     "full_history": metrics_as_dict(evaluation.full_history),
@@ -3229,7 +3282,7 @@ async def _candidate_policy_run(
                 historical_evidence=(
                     f"n={evaluation.full_history.n}; 12M median excess="
                     f"{evaluation.full_history.median_excess_return_pct}%; "
-                    f"excluding 2020={evaluation.excluding_2020.median_excess_return_pct}%."
+                    f"excluding 2020={evaluation.excluding_2020.median_excess_return_pct}% ({benchmark})."
                 ),
                 proposed_adjustment=str(spec.adjustment),
                 expected_benefit=(

@@ -94,3 +94,14 @@ class WalkForwardOutcomeRepository(BaseRepository[WalkForwardOutcome]):
             return existing, False
         row = WalkForwardOutcome(**data.model_dump())
         return await self.add(row), True
+
+    async def backfill_tri_returns(
+        self, outcome: WalkForwardOutcome, fields: dict[str, object]
+    ) -> WalkForwardOutcome:
+        """Add the Phase 6G benchmark dimension to an existing immutable
+        outcome without changing its frozen decision, price-index outcome, or
+        status.  This is an additive provenance backfill only."""
+        for key, value in fields.items():
+            setattr(outcome, key, value)
+        await self.session.flush()
+        return outcome

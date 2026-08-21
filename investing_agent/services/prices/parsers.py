@@ -43,8 +43,9 @@ from investing_agent.services.prices.interfaces import ParsedBenchmarkPrice, Par
 _EQUITY_SERIES = "EQ"
 
 # Internal benchmark_code -> the exact "Index Name" string used in NSE's
-# index close-all file. Adding NIFTY 50 TRI later is a one-line addition
-# here, not a schema change.
+# index close-all file. Total-return indices are intentionally not listed:
+# NSE's close-all archive publishes the price index but not NIFTY 50 TRI.
+# They are ingested through the separately audited Nifty Indices TRI endpoint.
 BENCHMARK_INDEX_NAMES: dict[str, str] = {
     "NIFTY_50": "Nifty 50",
 }

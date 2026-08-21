@@ -9,9 +9,9 @@ archived download, not the undocumented nseindia.com/api/* JSON surface.
 Same host (archives.nseindia.com) and stability profile as the legacy
 equity bhavcopy; confirmed live during the capability spike.
 
-Starts with NIFTY 50 (the price index). NIFTY 50 TRI is a different index
-name in the same file and can be added later purely by extending
-parsers.BENCHMARK_INDEX_NAMES -- no provider/schema change needed.
+Starts with NIFTY 50 (the price index). NIFTY 50 TRI is not present in this
+archive; it is fetched from Nifty Indices' separately audited total-return
+history endpoint (see ``nifty_tri.py``).
 """
 
 from datetime import date, datetime

@@ -1999,6 +1999,16 @@ class WalkForwardOutcome(Base):
     excess_return_3m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     excess_return_6m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     excess_return_12m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    # NIFTY 50 total-return index comparison.  The legacy benchmark_return_*
+    # / excess_return_* fields above remain the NIFTY 50 price index.
+    benchmark_tri_return_1m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    benchmark_tri_return_3m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    benchmark_tri_return_6m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    benchmark_tri_return_12m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_tri_1m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_tri_3m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_tri_6m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_tri_12m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     max_drawdown_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     # SCORED | PARTIAL | UNSCORABLE
     outcome_status: Mapped[str] = mapped_column(String(12), nullable=False)

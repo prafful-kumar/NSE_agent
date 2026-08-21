@@ -42,6 +42,7 @@ from investing_agent.services.walkforward.returns import (
 )
 
 BENCHMARK_CODE = "NIFTY_50"
+TRI_BENCHMARK_CODE = "NIFTY_50_TRI"
 _HORIZONS: list[tuple[int, str]] = [(1, "1m"), (3, "3m"), (6, "6m"), (12, "12m")]
 
 
@@ -56,6 +57,8 @@ def _add_months(d: date, months: int) -> date:
 async def score_outcome(
     session: AsyncSession, *, decision: WalkForwardDecision
 ) -> WalkForwardOutcome:
+    repo = WalkForwardOutcomeRepository(session)
+    existing = await repo.get_by_decision_id(decision.id)
     symbol = decision.symbol
     decision_at = decision.decision_at
 
@@ -65,12 +68,15 @@ async def score_outcome(
 
     entry = await resolve_entry_price(session, symbol, decision_at)
     benchmark_entry = await resolve_benchmark_entry_price(session, BENCHMARK_CODE, decision_at)
+    tri_entry = await resolve_benchmark_entry_price(session, TRI_BENCHMARK_CODE, decision_at)
 
     notes: list[str] = []
     if entry.reason:
         notes.append(f"ENTRY: {entry.reason}")
     if benchmark_entry.reason:
         notes.append(f"ENTRY_BENCHMARK: {benchmark_entry.reason}")
+    if tri_entry.reason:
+        notes.append(f"ENTRY_BENCHMARK_TRI: {tri_entry.reason}")
 
     fields: dict[str, object] = {
         "entry_price": entry.price,
@@ -84,6 +90,7 @@ async def score_outcome(
         target_date = _add_months(decision_at, months)
         horizon = await resolve_horizon_price(session, symbol, target_date)
         benchmark_horizon = await resolve_benchmark_horizon_price(session, BENCHMARK_CODE, target_date)
+        tri_horizon = await resolve_benchmark_horizon_price(session, TRI_BENCHMARK_CODE, target_date)
 
         fields[f"price_{label}"] = horizon.price
         fields[f"price_{label}_date"] = horizon.trading_date
@@ -91,10 +98,14 @@ async def score_outcome(
             notes.append(f"{label.upper()}: {horizon.reason}")
         if benchmark_horizon.reason:
             notes.append(f"{label.upper()}_BENCHMARK: {benchmark_horizon.reason}")
+        if tri_horizon.reason:
+            notes.append(f"{label.upper()}_BENCHMARK_TRI: {tri_horizon.reason}")
 
         stock_return: object = None
         benchmark_return: object = None
         excess_return: object = None
+        benchmark_tri_return: object = None
+        excess_return_tri: object = None
 
         if entry.price is not None and horizon.price is not None and horizon.trading_date is not None:
             factor = cumulative_split_factor(events, decision_at, horizon.trading_date)
@@ -107,10 +118,16 @@ async def score_outcome(
 
         if stock_return is not None and benchmark_return is not None:
             excess_return = stock_return - benchmark_return
+        if tri_entry.price is not None and tri_horizon.price is not None:
+            benchmark_tri_return = simple_return(tri_entry.price, tri_horizon.price)
+        if stock_return is not None and benchmark_tri_return is not None:
+            excess_return_tri = stock_return - benchmark_tri_return
 
         fields[f"stock_return_{label}"] = stock_return
         fields[f"benchmark_return_{label}"] = benchmark_return
         fields[f"excess_return_{label}"] = excess_return
+        fields[f"benchmark_tri_return_{label}"] = benchmark_tri_return
+        fields[f"excess_return_tri_{label}"] = excess_return_tri
 
         if stock_return is not None:
             scored_count += 1
@@ -135,7 +152,13 @@ async def score_outcome(
     else:
         outcome_status = "UNSCORABLE"
 
-    repo = WalkForwardOutcomeRepository(session)
+    tri_fields = {
+        key: value
+        for key, value in fields.items()
+        if key.startswith("benchmark_tri_return_") or key.startswith("excess_return_tri_")
+    }
+    if existing is not None:
+        return await repo.backfill_tri_returns(existing, tri_fields)
     row, _created = await repo.create_if_not_exists(
         WalkForwardOutcomeCreate(
             decision_id=decision.id,

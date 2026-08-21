@@ -22,6 +22,13 @@ from investing_agent.services.walkforward.audit import AuditRow
 
 _HORIZONS = ("1m", "3m", "6m", "12m")
 _HUNDRED = Decimal("100")
+BenchmarkKind = str  # PRICE_INDEX | TRI; kept string for CLI/JSON compatibility.
+
+
+def _excess_return(row: AuditRow, horizon: str, benchmark_kind: BenchmarkKind) -> Decimal | None:
+    if benchmark_kind == "TRI":
+        return row.excess_return_tri.get(horizon)
+    return row.excess_return[horizon]
 
 
 def holding_age_bucket(days: int | None) -> str:
@@ -100,10 +107,14 @@ def decision_dollar_impact(row: AuditRow, horizon: str) -> Decimal | None:
     return quantity_delta * price_move_per_share
 
 
-def summarize_horizon(rows: Sequence[AuditRow], horizon: str) -> dict:
+def summarize_horizon(
+    rows: Sequence[AuditRow], horizon: str, benchmark_kind: BenchmarkKind = "PRICE_INDEX"
+) -> dict:
     included = [r for r in rows if r.included_in_aggregate]
     stock = [r.stock_return[horizon] for r in included if r.stock_return[horizon] is not None]
-    excess = [r.excess_return[horizon] for r in included if r.excess_return[horizon] is not None]
+    excess = [
+        value for r in included if (value := _excess_return(r, horizon, benchmark_kind)) is not None
+    ]
     impacts = [
         v for r in included if (v := decision_dollar_impact(r, horizon)) is not None
     ]
@@ -127,9 +138,15 @@ def summarize_horizon(rows: Sequence[AuditRow], horizon: str) -> dict:
 
 
 def aggregate_by(
-    rows: Sequence[AuditRow], key_fn: Callable[[AuditRow], str], horizon: str
+    rows: Sequence[AuditRow],
+    key_fn: Callable[[AuditRow], str],
+    horizon: str,
+    benchmark_kind: BenchmarkKind = "PRICE_INDEX",
 ) -> dict[str, dict]:
-    return {key: summarize_horizon(group, horizon) for key, group in group_by(rows, key_fn).items()}
+    return {
+        key: summarize_horizon(group, horizon, benchmark_kind)
+        for key, group in group_by(rows, key_fn).items()
+    }
 
 
 def drawdown_distribution(rows: Sequence[AuditRow]) -> dict:
@@ -162,25 +179,30 @@ def data_quality_counts(rows: Sequence[AuditRow]) -> dict:
     return counts
 
 
-def build_report(rows: Sequence[AuditRow]) -> dict:
+def _build_horizon_report(rows: Sequence[AuditRow], benchmark_kind: BenchmarkKind) -> dict[str, dict]:
     by_horizon: dict[str, dict] = {}
     for horizon in _HORIZONS:
         by_horizon[horizon] = {
-            "overall": summarize_horizon(rows, horizon),
-            "by_action": aggregate_by(rows, lambda r: r.action, horizon),
-            "by_year": aggregate_by(rows, lambda r: str(r.calendar_year), horizon),
+            "overall": summarize_horizon(rows, horizon, benchmark_kind),
+            "by_action": aggregate_by(rows, lambda r: r.action, horizon, benchmark_kind),
+            "by_year": aggregate_by(rows, lambda r: str(r.calendar_year), horizon, benchmark_kind),
             "by_holding_age": aggregate_by(
-                rows, lambda r: holding_age_bucket(r.holding_age_days), horizon
+                rows, lambda r: holding_age_bucket(r.holding_age_days), horizon, benchmark_kind
             ),
             "by_concentration": aggregate_by(
-                rows, lambda r: concentration_bucket(r.concentration_pct), horizon
+                rows, lambda r: concentration_bucket(r.concentration_pct), horizon, benchmark_kind
             ),
         }
+    return by_horizon
 
+
+def build_report(rows: Sequence[AuditRow]) -> dict:
     return {
         "n_events_total": len(rows),
         "n_events_included": sum(1 for r in rows if r.included_in_aggregate),
-        "by_horizon": by_horizon,
+        # Backward-compatible price-index report.
+        "by_horizon": _build_horizon_report(rows, "PRICE_INDEX"),
+        "by_horizon_tri": _build_horizon_report(rows, "TRI"),
         "drawdown_distribution": drawdown_distribution(rows),
         "data_quality_counts": data_quality_counts(rows),
     }

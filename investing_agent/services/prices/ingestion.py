@@ -217,6 +217,13 @@ async def sync_benchmark_prices(
     end_date: date,
     provider: BenchmarkPriceProvider,
 ) -> PriceSyncSummary:
+    fetch_range = getattr(provider, "fetch_range", None)
+    parse_range = getattr(provider, "parse_range", None)
+    if callable(fetch_range) and callable(parse_range):
+        return await _sync_benchmark_prices_range(
+            session, benchmark_code, start_date, end_date, provider, fetch_range, parse_range
+        )
+
     summary = PriceSyncSummary()
     archive_repo = PriceArchiveFileRepository(session)
     price_repo = BenchmarkPriceRepository(session)
@@ -245,11 +252,18 @@ async def sync_benchmark_prices(
             continue
 
         content_hash = hashlib.sha256(raw.content).hexdigest()
-        storage_path = write_archive(raw.content, "NSE_INDEX_BHAVCOPY", content_hash, "csv")
+        source_format = provider.source_format(trading_date)
+        is_total_return = source_format == "NIFTY_INDICES_TOTAL_RETURN"
+        storage_path = write_archive(
+            raw.content,
+            "NSE_INDEX_TOTAL_RETURN" if is_total_return else "NSE_INDEX_BHAVCOPY",
+            content_hash,
+            "json" if is_total_return else "csv",
+        )
         archive_file, _ = await archive_repo.get_or_create(
             PriceArchiveFileCreate(
-                data_type="INDEX_BHAVCOPY",
-                source_format=provider.source_format(trading_date),
+                data_type="INDEX_TOTAL_RETURN" if is_total_return else "INDEX_BHAVCOPY",
+                source_format=source_format,
                 trading_date=trading_date,
                 source_url=raw.source_url,
                 content_hash=content_hash,
@@ -271,7 +285,7 @@ async def sync_benchmark_prices(
                     high=row.high,
                     low=row.low,
                     close=row.close,
-                    source="NSE_INDICES_CLOSE_ALL",
+                    source=source_format,
                     source_document_id=archive_file.id,
                 )
             )
@@ -280,4 +294,84 @@ async def sync_benchmark_prices(
             else:
                 summary.rows_skipped_duplicate += 1
 
+    return summary
+
+
+async def _sync_benchmark_prices_range(
+    session: AsyncSession,
+    benchmark_code: str,
+    start_date: date,
+    end_date: date,
+    provider: BenchmarkPriceProvider,
+    fetch_range,
+    parse_range,
+) -> PriceSyncSummary:
+    """Persist a range-capable benchmark source without one HTTP call per day.
+
+    Nifty Indices provides up to a year of TRI history per response. Each raw
+    response is archived once and is the shared provenance document for every
+    parsed day it contains.
+    """
+    summary = PriceSyncSummary(dates_checked=len(_weekdays_between(start_date, end_date)))
+    archive_repo = PriceArchiveFileRepository(session)
+    price_repo = BenchmarkPriceRepository(session)
+    requested_weekdays = set(_weekdays_between(start_date, end_date))
+    available_dates: set[date] = set()
+    batch_start = start_date
+    while batch_start <= end_date:
+        batch_end = min(batch_start + timedelta(days=365), end_date)
+        try:
+            raw = await fetch_range(batch_start, batch_end)
+        except SourceAccessError as exc:
+            summary.errors.append(f"{batch_start}..{batch_end}: blocked — {exc}")
+            break
+        except SourceTransientError as exc:
+            summary.errors.append(f"{batch_start}..{batch_end}: {exc}")
+            batch_start = batch_end + timedelta(days=1)
+            continue
+        if raw is None:
+            batch_start = batch_end + timedelta(days=1)
+            continue
+
+        content_hash = hashlib.sha256(raw.content).hexdigest()
+        source_format = provider.source_format(batch_start)
+        storage_path = write_archive(raw.content, "NSE_INDEX_TOTAL_RETURN", content_hash, "json")
+        archive_file, _ = await archive_repo.get_or_create(
+            PriceArchiveFileCreate(
+                data_type="INDEX_TOTAL_RETURN",
+                source_format=source_format,
+                trading_date=batch_start,
+                source_url=raw.source_url,
+                content_hash=content_hash,
+                storage_path=storage_path,
+                mime_type=raw.content_type,
+                size_bytes=len(raw.content),
+            )
+        )
+        for row in parse_range(raw):
+            if (
+                row.benchmark_code != benchmark_code
+                or row.trading_date not in requested_weekdays
+            ):
+                continue
+            available_dates.add(row.trading_date)
+            _, was_created = await price_repo.create_if_not_exists(
+                BenchmarkPriceCreate(
+                    benchmark_code=row.benchmark_code,
+                    trading_date=row.trading_date,
+                    open=row.open,
+                    high=row.high,
+                    low=row.low,
+                    close=row.close,
+                    source=source_format,
+                    source_document_id=archive_file.id,
+                )
+            )
+            if was_created:
+                summary.rows_created += 1
+            else:
+                summary.rows_skipped_duplicate += 1
+        batch_start = batch_end + timedelta(days=1)
+
+    summary.dates_no_data = len(requested_weekdays - available_dates)
     return summary

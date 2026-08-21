@@ -103,6 +103,14 @@ class WalkForwardOutcomeCreate(BaseSchema):
     excess_return_3m: Decimal | None = None
     excess_return_6m: Decimal | None = None
     excess_return_12m: Decimal | None = None
+    benchmark_tri_return_1m: Decimal | None = None
+    benchmark_tri_return_3m: Decimal | None = None
+    benchmark_tri_return_6m: Decimal | None = None
+    benchmark_tri_return_12m: Decimal | None = None
+    excess_return_tri_1m: Decimal | None = None
+    excess_return_tri_3m: Decimal | None = None
+    excess_return_tri_6m: Decimal | None = None
+    excess_return_tri_12m: Decimal | None = None
     max_drawdown_pct: Decimal | None = None
     outcome_status: OutcomeStatus
     data_quality_notes: list[str] = []
@@ -133,6 +141,14 @@ class WalkForwardOutcomeRead(BaseSchema):
     excess_return_3m: Decimal | None
     excess_return_6m: Decimal | None
     excess_return_12m: Decimal | None
+    benchmark_tri_return_1m: Decimal | None
+    benchmark_tri_return_3m: Decimal | None
+    benchmark_tri_return_6m: Decimal | None
+    benchmark_tri_return_12m: Decimal | None
+    excess_return_tri_1m: Decimal | None
+    excess_return_tri_3m: Decimal | None
+    excess_return_tri_6m: Decimal | None
+    excess_return_tri_12m: Decimal | None
     max_drawdown_pct: Decimal | None
     outcome_status: OutcomeStatus
     data_quality_notes: list[str]

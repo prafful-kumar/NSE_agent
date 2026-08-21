@@ -306,3 +306,39 @@ class TestSyncBenchmarkPricesEndToEnd:
         assert len(rows) == 1
         assert rows[0].close == Decimal("24188.65")
         assert rows[0].source_document_id is not None
+
+    async def test_range_source_archives_once_and_excludes_non_trading_days(self, db_session) -> None:
+        from investing_agent.services.prices.ingestion import sync_benchmark_prices
+
+        class RangeProvider:
+            async def fetch_range(self, start_date, end_date):
+                return RawPriceFile(
+                    content=b'{"official":"range-response"}',
+                    source_url="https://example.test/tri?start=2025-01-02&end=2025-01-05",
+                    content_type="application/json",
+                    fetched_at=None,
+                )
+
+            def parse_range(self, raw):
+                return [
+                    ParsedBenchmarkPrice("PHASE6GTRI", date(2025, 1, 2), *(Decimal("100"),) * 4),
+                    # Saturday values in a range response must not become benchmark observations.
+                    ParsedBenchmarkPrice("PHASE6GTRI", date(2025, 1, 4), *(Decimal("101"),) * 4),
+                ]
+
+            def source_format(self, trading_date):
+                return "NIFTY_INDICES_TOTAL_RETURN"
+
+        summary = await sync_benchmark_prices(
+            db_session, "PHASE6GTRI", date(2025, 1, 2), date(2025, 1, 5), RangeProvider()
+        )
+        assert summary.rows_created == 1
+        assert summary.dates_checked == 2
+        assert summary.dates_no_data == 1
+
+        from investing_agent.db.repositories.prices import BenchmarkPriceRepository
+
+        rows = await BenchmarkPriceRepository(db_session).list_between(
+            "PHASE6GTRI", date(2025, 1, 2), date(2025, 1, 5)
+        )
+        assert [row.trading_date for row in rows] == [date(2025, 1, 2)]
