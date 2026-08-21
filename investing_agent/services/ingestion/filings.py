@@ -79,10 +79,27 @@ class FilingIngestionService:
         self._session = session
         self._source = source or NSEDataSource()
 
-    async def sync(self, symbol: str) -> FilingSyncResult:
+    async def sync(
+        self,
+        symbol: str,
+        *,
+        since: datetime | None = None,
+        filing_types: frozenset[str] | None = None,
+    ) -> FilingSyncResult:
+        """Discover and archive selected announcement attachments.
+
+        ``since`` is inclusive and is applied to the issuer-provided
+        announcement timestamp.  A scoped run skips records with no
+        parseable issuer timestamp rather than treating their retrieval time
+        as historical availability.  ``filing_types`` narrows (never expands)
+        the normal archive allowlist.
+        """
         symbol = symbol.upper()
         result = FilingSyncResult(symbol=symbol)
         company = await ensure_company(self._session, symbol)
+        allowed_types = filing_types or _AUTO_ARCHIVE_TYPES
+        if not allowed_types <= _AUTO_ARCHIVE_TYPES:
+            raise ValueError("filing_types must be a subset of the archive allowlist")
 
         try:
             announcements = await self._source.get_announcements(symbol)
@@ -97,7 +114,11 @@ class FilingIngestionService:
         result.announcements_discovered = len(announcements)
 
         for announcement in announcements:
-            if announcement.filing_type not in _AUTO_ARCHIVE_TYPES:
+            if announcement.filing_type not in allowed_types:
+                continue
+            if since is not None and (
+                announcement.published_at is None or announcement.published_at < since
+            ):
                 continue
             if not announcement.document_url:
                 continue

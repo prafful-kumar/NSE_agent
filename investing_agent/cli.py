@@ -282,6 +282,24 @@ def sync_filings(symbol: str) -> None:
     asyncio.run(_sync_filings(symbol))
 
 
+@cli.command("sync-result-filings")
+@click.argument("symbol")
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    required=True,
+    help="Inclusive issuer filing date (YYYY-MM-DD); records without a timestamp are skipped.",
+)
+def sync_result_filings(symbol: str, since: datetime) -> None:
+    """Archive recent NSE financial-result PDFs/ZIPs for SYMBOL only.
+
+    This command archives primary attachments and their metadata only.  It
+    never creates or verifies FinancialResult facts; use the existing manual
+    verification workflow after inspecting the archived document.
+    """
+    asyncio.run(_sync_result_filings(symbol, since.replace(tzinfo=UTC)))
+
+
 async def _sync_filings(symbol: str) -> None:
     from investing_agent.db.session import AsyncSessionLocal
     from investing_agent.services.ingestion.filings import FilingIngestionService
@@ -308,6 +326,37 @@ async def _sync_filings(symbol: str) -> None:
         click.echo("  WARNING: source signaled an access block (403) — sync stopped early")
     for row in result.archived_documents[:10]:
         click.echo(f"    {row.id}  [{row.filing_type:20s}]  {row.title}")
+
+
+async def _sync_result_filings(symbol: str, since: datetime) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.filings import FilingIngestionService
+
+    async with AsyncSessionLocal() as session:
+        service = FilingIngestionService(session)
+        try:
+            result = await service.sync(
+                symbol, since=since, filing_types=frozenset({"quarterly_result"})
+            )
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+        finally:
+            await service.aclose()
+
+    click.echo(f"\nFinancial-result filing sync — {result.symbol}")
+    click.echo(f"  Since (issuer timestamp)  : {since.isoformat()}")
+    click.echo(f"  Announcements discovered  : {result.announcements_discovered}")
+    click.echo(f"  Documents archived        : {result.documents_archived}")
+    click.echo(f"  Already archived          : {result.documents_already_archived}")
+    click.echo(f"  ZIP children archived     : {result.zip_children_archived}")
+    click.echo(f"  Download failures         : {result.download_failures}")
+    if result.blocked:
+        click.echo("  WARNING: source signaled an access block (403) — sync stopped early")
+    for row in result.archived_documents[:10]:
+        click.echo(f"    {row.id}  [{row.document_type}]  {row.title}")
 
 
 @cli.command("sync-company-data")

@@ -60,6 +60,7 @@ async def archive_document(
         source_type=doc.source_type,
         source_url=doc.source_url,
         published_at=doc.published_at,
+        available_at=doc.published_at,
         data_category="fact",
         parent_document_id=doc.parent_document_id,
     )

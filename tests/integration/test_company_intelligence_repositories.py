@@ -79,6 +79,24 @@ async def source_doc(db_session, bel):
 
 
 class TestSourceDocumentRepositoryIdempotency:
+    async def test_explicit_primary_filing_available_at_is_preserved(self, db_session, bel) -> None:
+        from investing_agent.db.repositories.source_document import SourceDocumentRepository
+
+        available_at = datetime(2026, 7, 17, 19, 7, 44, tzinfo=UTC)
+        doc, _ = await SourceDocumentRepository(db_session).get_or_create(
+            SourceDocumentCreate(
+                company_id=bel.id, symbol=bel.symbol, exchange="NSE",
+                filing_type="quarterly_result", document_type="pdf",
+                title="Q1 FY27 results", content_hash="a" * 64,
+                source_type="nse_filing_pdf", source_url="https://nse/filing-q1fy27",
+                published_at=available_at, available_at=available_at, data_category="fact",
+            )
+        )
+        await db_session.flush()
+
+        assert doc.published_at == available_at
+        assert doc.available_at == available_at
+
     async def test_get_or_create_is_idempotent_on_same_content(self, db_session, bel) -> None:
         from investing_agent.db.repositories.source_document import SourceDocumentRepository
 

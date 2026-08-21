@@ -38,7 +38,11 @@ def _company(symbol: str = "BEL") -> MagicMock:
 
 
 def _announcement(
-    filing_type: str, title: str, document_url: str | None, symbol: str = "BEL"
+    filing_type: str,
+    title: str,
+    document_url: str | None,
+    symbol: str = "BEL",
+    published_at: datetime | None = datetime(2026, 8, 10, tzinfo=UTC),
 ) -> RawAnnouncement:
     return RawAnnouncement(
         provider="NSE",
@@ -46,7 +50,7 @@ def _announcement(
         filing_type=filing_type,
         title=title,
         filing_date="10-Aug-2026 17:35:59",
-        published_at=datetime(2026, 8, 10, tzinfo=UTC),
+        published_at=published_at,
         document_url=document_url,
         source_url=f"https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={symbol}",
         raw={},
@@ -114,6 +118,10 @@ class FakeArchiveStore:
         row.title = doc.title
         row.filing_type = doc.filing_type
         row.document_type = doc.document_type
+        row.published_at = doc.published_at
+        row.available_at = doc.published_at
+        row.source_url = doc.source_url
+        row.source_type = doc.source_type
         row.storage_path = f"{doc.company_symbol}/{content_hash}.{doc.document_type}"
         row.content_hash = content_hash
         row.parent_document_id = doc.parent_document_id
@@ -282,6 +290,68 @@ class TestInvestorPresentationArchival:
 
         assert result.documents_archived == 0
         assert result.download_failures == 0  # a successful-but-unsupported download, not a failure
+
+
+class TestFinancialResultArchival:
+    @pytest.mark.asyncio
+    async def test_scoped_result_sync_archives_pdf_and_preserves_issuer_timestamp(self) -> None:
+        company = _company("BEL")
+        store = FakeArchiveStore()
+        url = "https://nsearchives.nseindia.com/corporate/BEL_results.pdf"
+        source = FakeFilingSource(
+            announcements=[
+                _announcement("quarterly_result", "Outcome of Board Meeting - Results", url),
+                _announcement("announcement", "Board Meeting Intimation", "https://x/ignore.pdf"),
+            ],
+            downloads={
+                url: DownloadedAttachment(
+                    content=b"%PDF-1.4 result filing",
+                    content_type="application/pdf",
+                    is_pdf=True,
+                    is_zip=False,
+                )
+            },
+        )
+        svc = _service(source)
+        with _patched(company, store):
+            result = await svc.sync(
+                "BEL",
+                since=datetime(2026, 8, 1, tzinfo=UTC),
+                filing_types=frozenset({"quarterly_result"}),
+            )
+
+        assert source.download_calls == [url]
+        assert result.documents_archived == 1
+        archived = result.archived_documents[0]
+        assert archived.filing_type == "quarterly_result"
+        assert archived.published_at == datetime(2026, 8, 10, tzinfo=UTC)
+        assert archived.available_at == datetime(2026, 8, 10, tzinfo=UTC)
+        assert archived.source_type == "nse_filing_pdf"
+
+    @pytest.mark.asyncio
+    async def test_scoped_result_sync_excludes_old_and_timestampless_filings(self) -> None:
+        company = _company("BEL")
+        store = FakeArchiveStore()
+        old = _announcement(
+            "quarterly_result",
+            "FY25 Results",
+            "https://x/old.pdf",
+            published_at=datetime(2026, 3, 31, tzinfo=UTC),
+        )
+        unknown_time = _announcement(
+            "quarterly_result", "Unknown date", "https://x/unknown.pdf", published_at=None
+        )
+        source = FakeFilingSource(announcements=[old, unknown_time])
+        svc = _service(source)
+        with _patched(company, store):
+            result = await svc.sync(
+                "BEL",
+                since=datetime(2026, 4, 1, tzinfo=UTC),
+                filing_types=frozenset({"quarterly_result"}),
+            )
+
+        assert result.documents_archived == 0
+        assert source.download_calls == []
 
 
 class TestIdempotency:

@@ -343,9 +343,19 @@ def _classify_announcement(text: str | None) -> str:
         return "annual_report"
     if "transcript" in t or "con call" in t or "concall" in t or "earnings call" in t:
         return "concall_transcript"
-    if (
-        "financial result" in t or "quarterly result" in t
-        or "un-audited" in t or "unaudited" in t or "audited financial" in t
+    if any(
+        phrase in t
+        for phrase in (
+            "financial result",
+            "quarterly result",
+            "outcome of board meeting",
+            "board meeting outcome",
+            "regulation 33",
+            "un-audited",
+            "unaudited",
+            "audited financial",
+            "audited result",
+        )
     ):
         return "quarterly_result"
     if "order" in t and ("contract" in t or "bagging" in t or "receiving" in t):

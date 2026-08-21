@@ -49,7 +49,7 @@ class SourceDocumentRepository(BaseRepository[SourceDocument]):
         if existing:
             return existing, False
 
-        doc = SourceDocument(
+        values = dict(
             company_id=data.company_id,
             symbol=data.symbol,
             exchange=data.exchange,
@@ -68,6 +68,9 @@ class SourceDocumentRepository(BaseRepository[SourceDocument]):
             confidence=data.confidence,
             parent_document_id=data.parent_document_id,
         )
+        if data.available_at is not None:
+            values["available_at"] = data.available_at
+        doc = SourceDocument(**values)
         await self.add(doc)
 
         # Every new document starts its own version-1 chain.

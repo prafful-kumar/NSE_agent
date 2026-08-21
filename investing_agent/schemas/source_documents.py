@@ -42,6 +42,10 @@ class SourceDocumentCreate(BaseSchema):
     source_type: str
     source_url: str | None = None
     published_at: datetime | None = None
+    # For a primary filing, the issuer/exchange timestamp is the earliest
+    # defensible point-in-time availability.  Leave None only when the source
+    # did not expose a timestamp; the database then records ingestion time.
+    available_at: datetime | None = None
     data_category: str = "fact"
     confidence: float | None = None
     parent_document_id: uuid.UUID | None = None

@@ -59,11 +59,11 @@ class ProvenanceMixin:
     """Full provenance trail for Phase 3+ research data (filings, financials,
     corporate actions, company events).
 
-    available_at is distinct from published_at: published_at is when the
-    source (NSE/BSE/company) says the information became public; available_at
-    is when it became queryable in *our* system. Backtests must filter on
-    available_at, never published_at, to avoid look-ahead bias — a filing
-    published at 4pm might not be ingested until the next morning's batch run.
+    available_at is the earliest defensible point-in-time availability of a
+    record. For a primary NSE/BSE/company filing with an issuer timestamp it
+    is that publication timestamp; if the source cannot provide one it falls
+    back to ingestion time. Backtests filter on available_at, never infer an
+    earlier time from a reporting period or document content.
     """
     source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     source_url: Mapped[str | None] = mapped_column(Text)
