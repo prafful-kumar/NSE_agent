@@ -719,6 +719,61 @@ class Recommendation(TimestampMixin, Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+# ── Phase 7A current deterministic recommendation artifacts ────────────────
+
+class ValuationSnapshot(TimestampMixin, Base):
+    __tablename__ = "valuation_snapshots"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    valuation_method: Mapped[str] = mapped_column(String(50), nullable=False)
+    fair_value_low: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    fair_value_mid: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    fair_value_high: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    current_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    upside_downside_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+
+
+class RecommendationRun(TimestampMixin, Base):
+    __tablename__ = "recommendation_runs"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    rule_version: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    policy_layer_status: Mapped[str] = mapped_column(String(30), nullable=False, default="DISABLED")
+
+
+class RecommendationDecision(Base):
+    __tablename__ = "recommendation_decisions"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("recommendation_runs.id"), index=True, nullable=False)
+    company_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    base_action: Mapped[str] = mapped_column(String(30), nullable=False)
+    final_action: Mapped[str] = mapped_column(String(30), nullable=False)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    data_quality_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    data_gaps: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evidence_summary: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    valuation_inputs: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    risk_inputs: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    portfolio_context: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (UniqueConstraint("run_id", "symbol", name="uq_recommendation_decision_run_symbol"),)
+
+
+class RecommendationEvidenceLink(Base):
+    __tablename__ = "recommendation_evidence_links"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    recommendation_decision_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("recommendation_decisions.id", ondelete="CASCADE"), index=True, nullable=False)
+    evidence_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    evidence_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
 # ── Instrument master ─────────────────────────────────────────────────────────
 
 class InstrumentMaster(TimestampMixin, Base):

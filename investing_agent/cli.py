@@ -3308,6 +3308,25 @@ async def _candidate_policy_run(
     click.echo("\nCandidates recorded for manual review only; none are active in recommendations.")
 
 
+@cli.command("current-recommendations-run")
+@click.option("--user-id", default=None)
+@click.option("--as-of", default=None, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
+def current_recommendations_run_cmd(user_id: str | None, as_of: datetime | None) -> None:
+    """Generate Phase 7A deterministic recommendations; never executes trades."""
+    asyncio.run(_current_recommendations_run(user_id, as_of))
+
+
+async def _current_recommendations_run(user_id: str | None, as_of: datetime | None) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.current_recommendations import generate
+    resolved = user_id or get_settings().default_user_id
+    cutoff = as_of.replace(tzinfo=UTC) if as_of else None
+    async with AsyncSessionLocal() as session:
+        run = await generate(session, user_id=resolved, as_of=cutoff)
+        await session.commit()
+    click.echo(f"Phase 7A run {run.id} rule_version={run.rule_version} policy_layer=DISABLED")
+
+
 @cli.command("historical-agent-comparator-run")
 @click.option("--run-id", required=True, help="Existing frozen Phase 6D WalkForwardRun UUID")
 def historical_agent_comparator_run_cmd(run_id: str) -> None:
