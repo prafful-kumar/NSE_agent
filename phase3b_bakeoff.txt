@@ -1,0 +1,45 @@
+
+============================================================
+BEL
+============================================================
+
+[NSE] corporate actions: 20 rows
+  dividend   ex=13-Aug-2026 rec=13-Aug-2026 pay=None amt='Dividend - Re 0.55 Per Share'
+  dividend   ex=06-Mar-2026 rec=06-Mar-2026 pay=None amt='Interim Dividend - Rs 1.95 Per Share'
+  dividend   ex=14-Aug-2025 rec=14-Aug-2025 pay=None amt='Dividend - Rs 0.90 Per Share'
+
+[NSE] quarterly results: 5 rows
+  period=01-OCT-2024..31-DEC-2024 pat=131606 eps=1.81 filed_at=2025-01-30 00:00:00+00:00 extraction=structured_api
+  period=01-JUL-2024..30-SEP-2024 pat=109127 eps=1.49 filed_at=2024-10-25 00:00:00+00:00 extraction=structured_api
+
+[BSE] corporate actions: 0 rows (expected 0 — see bse_source.py docstring)
+
+[NSE] announcements: 1025 rows
+  announcement         date=13-Aug-2026 17:48:45 url='https://nsearchives.nseindia.com/corporate/BEL_13082026174654_Lettersigned.pdf' title='Change in Director(s)'
+  announcement         date=10-Aug-2026 17:35:59 url='https://nsearchives.nseindia.com/corporate/BEL_10082026173144_Lettersigned.pdf' title='Bagging/Receiving of orders/contracts'
+  announcement         date=05-Aug-2026 21:22:30 url='https://nsearchives.nseindia.com/corporate/BEL_05082026212159_Lettersigned.pdf' title='Copy of Newspaper Publication'
+  announcement         date=05-Aug-2026 21:17:59 url='https://nsearchives.nseindia.com/corporate/BEL_05082026211750_Lettersigned.pdf' title='General Updates'
+  announcement         date=05-Aug-2026 21:09:43 url='https://nsearchives.nseindia.com/corporate/BEL_05082026210844_Lettersigned.pdf' title='General Updates'
+
+[NSE] annual reports: 0 rows
+
+[NSE] investor presentations (filtered from announcements): 3 rows
+  date=30-Aug-2022 13:53:09 url='https://nsearchives.nseindia.com/corporate/BEL_30082022135309_NSE.pdf' title='Investor Presentation'
+  date=28-Sep-2021 14:27:24 url='https://nsearchives.nseindia.com/corporate/BEL_28092021142723_NSE.pdf' title='Investor Presentation'
+  date=30-May-2018 12:51:00 url='https://nsearchives.nseindia.com/corporate/NSE_30052018125120_021.zip' title='Investor Presentation'
+
+[NSE] PDF check on first candidate URL: 'https://nsearchives.nseindia.com/corporate/BEL_13082026174654_Lettersigned.pdf'
+  is_pdf=True size=7094345 content_type='application/pdf'
+
+============================================================
+HAL
+============================================================
+
+[NSE] corporate actions: 20 rows
+  dividend   ex=14-Aug-2026 rec=14-Aug-2026 pay=None amt='Dividend - Rs 10 Per Sh'
+  dividend   ex=18-Feb-2026 rec=18-Feb-2026 pay=None amt='Interim Dividend - Rs 35 Per Share'
+  dividend   ex=21-Aug-2025 rec=21-Aug-2025 pay=None amt='Dividend - Rs 15 Per Share'
+
+[NSE] quarterly results: 5 rows
+  period=01-OCT-2024..31-DEC-2024 pat=143260 eps=21.42 filed_at=2025-02-12 00:00:00+00:00 extraction=structured_api
+  period=01-JUL-2024..30-SEP-2024 pat=149036 eps=22.28 filed_at=2024-11-14 00:00:00+00:00 extraction=structured_api

@@ -68,25 +68,27 @@ class TestFeatureSnapshotRepository:
             company_id=company.id, financial_period_id=period.id, cutoff_at=CUTOFF,
             payload={"target_period": {"fiscal_year": 2026}},
         )
-        first = await repo.get_or_create(data)
+        first, first_reused = await repo.get_or_create(data)
         await db_session.flush()
-        second = await repo.get_or_create(data)
+        second, second_reused = await repo.get_or_create(data)
         await db_session.flush()
 
         assert first.id == second.id
+        assert first_reused is False
+        assert second_reused is True
 
     async def test_different_cutoff_creates_a_new_row(self, db_session, company, period) -> None:
         from investing_agent.db.repositories.estimation import FeatureSnapshotRepository
 
         repo = FeatureSnapshotRepository(db_session)
-        first = await repo.get_or_create(
+        first, _ = await repo.get_or_create(
             FeatureSnapshotCreate(
                 company_id=company.id, financial_period_id=period.id, cutoff_at=CUTOFF,
                 payload={"target_period": {"fiscal_year": 2026}},
             )
         )
         await db_session.flush()
-        second = await repo.get_or_create(
+        second, _ = await repo.get_or_create(
             FeatureSnapshotCreate(
                 company_id=company.id, financial_period_id=period.id,
                 cutoff_at=CUTOFF.replace(hour=13),
@@ -112,7 +114,7 @@ class TestEstimateRunRepository:
             FeatureSnapshotRepository,
         )
 
-        snapshot = await FeatureSnapshotRepository(db_session).get_or_create(
+        snapshot, _ = await FeatureSnapshotRepository(db_session).get_or_create(
             FeatureSnapshotCreate(
                 company_id=company.id, financial_period_id=period.id, cutoff_at=CUTOFF,
                 payload={"target_period": {"fiscal_year": 2026}},
@@ -147,13 +149,13 @@ class TestEstimateRunRepository:
         )
 
         snapshot_repo = FeatureSnapshotRepository(db_session)
-        snap1 = await snapshot_repo.get_or_create(
+        snap1, _ = await snapshot_repo.get_or_create(
             FeatureSnapshotCreate(
                 company_id=company.id, financial_period_id=period.id, cutoff_at=CUTOFF,
                 payload={"target_period": {"fiscal_year": 2026}},
             )
         )
-        snap2 = await snapshot_repo.get_or_create(
+        snap2, _ = await snapshot_repo.get_or_create(
             FeatureSnapshotCreate(
                 company_id=company.id, financial_period_id=other_period.id, cutoff_at=CUTOFF,
                 payload={"target_period": {"fiscal_year": 2026}},

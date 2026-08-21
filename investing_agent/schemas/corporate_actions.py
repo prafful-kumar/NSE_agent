@@ -117,3 +117,42 @@ class ResultCalendarItem(BaseSchema):
     days_to_expected_result: int | None
     verification_status: str
     is_in_portfolio: bool = False
+
+
+# ── Opening-position adjustments (Phase 6B) ──────────────────────────────────
+# Account-scoped, reconciliation-derived synthetic opening lots for symbols
+# whose real acquisition trade is missing from the tradebook (e.g. a SELL
+# with no prior BUY). Distinct from CorporateActionCreate/Read above, which
+# already models split/bonus events -- this is a per-account gap-filling
+# record, not a market-wide fact.
+
+AdjustmentConfidence = Literal["LOW", "MEDIUM", "HIGH"]
+
+
+class OpeningPositionAdjustmentCreate(BaseSchema):
+    broker_account_id: uuid.UUID
+    symbol: str
+    isin: str | None = None
+    company_id: uuid.UUID | None = None
+    opening_date: date
+    quantity: Decimal
+    cost_price: Decimal
+    source: str  # e.g. "ZERODHA_PNL_RECONCILIATION"
+    confidence: AdjustmentConfidence
+    reason: str  # e.g. "MISSING_TRADE_HISTORY"
+    notes: str | None = None
+
+
+class OpeningPositionAdjustmentRead(TimestampedSchema):
+    id: uuid.UUID
+    broker_account_id: uuid.UUID
+    symbol: str
+    isin: str | None
+    company_id: uuid.UUID | None
+    opening_date: date
+    quantity: Decimal
+    cost_price: Decimal
+    source: str
+    confidence: AdjustmentConfidence
+    reason: str
+    notes: str | None

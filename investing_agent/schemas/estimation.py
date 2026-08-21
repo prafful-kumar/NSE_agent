@@ -126,6 +126,8 @@ class FeatureSnapshotCreate(BaseSchema):
     financial_period_id: uuid.UUID
     cutoff_at: datetime
     payload: dict
+    input_fingerprint: str = ""
+    feature_builder_version: str = ""
 
 
 class FeatureSnapshotRead(TimestampedSchema):
@@ -134,6 +136,8 @@ class FeatureSnapshotRead(TimestampedSchema):
     financial_period_id: uuid.UUID
     cutoff_at: datetime
     payload: dict
+    input_fingerprint: str = ""
+    feature_builder_version: str = ""
 
 
 # ── EstimateRun ───────────────────────────────────────────────────────────

@@ -1316,11 +1316,20 @@ class FeatureSnapshot(TimestampMixin, Base):
     """The frozen information set an estimate was built from: everything
     known about a company as of cutoff_at, for a specific target period.
 
-    Content-addressed by (company_id, financial_period_id, cutoff_at) — building
-    the same snapshot twice is idempotent, returning the existing row. This is
-    what makes point-in-time backtesting reproducible: re-running a different
-    model_version against an identical frozen snapshot is a fair comparison,
-    and the payload is the audit trail of exactly what data was available.
+    Content-addressed by (company_id, financial_period_id, cutoff_at,
+    input_fingerprint, feature_builder_version) — building the same snapshot
+    twice (same key AND same underlying qualifying records) is idempotent,
+    returning the existing row. input_fingerprint is a hash over the ids and
+    updated_at timestamps of every record that fed the payload (historical
+    FinancialResult rows, OrderBookSnapshot, ManagementGuidance,
+    SegmentMetric, OperationalMetric) — if a newly-transcribed historical
+    result becomes visible at an unchanged cutoff_at (e.g. more history is
+    backfilled for a quarter that already had a cached snapshot), the
+    fingerprint changes and a *new* row is created rather than the stale one
+    being silently reused. Old rows are never mutated or deleted: an
+    EstimateRun's feature_snapshot_id keeps pointing at the exact frozen
+    snapshot it was generated from, so historical reproducibility holds even
+    as more snapshots accumulate for the same (company, period, cutoff).
 
     payload is a JSONB dict shaped like schemas.estimation.FeatureSnapshotPayload
     (historical financials, order book, guidance, segment/operational metrics,
@@ -1343,11 +1352,18 @@ class FeatureSnapshot(TimestampMixin, Base):
         DateTime(timezone=True), nullable=False, index=True
     )
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=""
+    )
+    feature_builder_version: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=""
+    )
 
     __table_args__ = (
         UniqueConstraint(
             "company_id", "financial_period_id", "cutoff_at",
-            name="uq_feature_snapshot_company_period_cutoff",
+            "input_fingerprint", "feature_builder_version",
+            name="uq_feature_snapshot_company_period_cutoff_fingerprint",
         ),
     )
 
@@ -1481,3 +1497,514 @@ class BacktestScore(TimestampMixin, Base):
     # without a join.
     verified_history_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     unverified_history_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+# ── Broker-account historical import (Phase 6A) ─────────────────────────────────
+# Provider-neutral: one BrokerAccount per (user, broker, account_label);
+# strategy_profile is fixed by broker (ZERODHA -> LONG_TERM, INDMONEY ->
+# MEDIUM_TERM), not user-configurable per account. Fact tables
+# (HistoricalTrade/CashFlow/Dividend) are deduplicated on
+# (broker_account_id, dedupe_key), never on file identity, because
+# statement exports routinely overlap in date range and must merge
+# idempotently. HistoricalPositionLot is the output of Phase 6B lot
+# reconstruction, not written by importers.
+
+class BrokerAccount(TimestampMixin, Base):
+    __tablename__ = "broker_accounts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    broker: Mapped[str] = mapped_column(String(20), nullable=False)  # ZERODHA | INDMONEY
+    account_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    strategy_profile: Mapped[str] = mapped_column(String(20), nullable=False)  # LONG_TERM | MEDIUM_TERM
+
+    trades: Mapped[list["HistoricalTrade"]] = relationship(back_populates="broker_account")
+    cash_flows: Mapped[list["HistoricalCashFlow"]] = relationship(back_populates="broker_account")
+    dividends: Mapped[list["HistoricalDividend"]] = relationship(back_populates="broker_account")
+    import_runs: Mapped[list["HistoricalImportRun"]] = relationship(back_populates="broker_account")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "broker", "account_label", name="uq_broker_account_user_broker_label",
+        ),
+    )
+
+
+class HistoricalImportRun(TimestampMixin, Base):
+    """One row per statement file imported. file_hash gives run-level
+    idempotency (re-importing a byte-identical file is a no-op); trade/
+    cash-flow/dividend-level idempotency is separately enforced via
+    dedupe_key, so overlapping-but-not-identical files still merge safely.
+    """
+
+    __tablename__ = "historical_import_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(10), nullable=False)  # SUCCESS|PARTIAL|FAILED
+    trades_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    trades_skipped_duplicate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cash_flows_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cash_flows_skipped_duplicate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dividends_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dividends_skipped_duplicate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    date_range_start: Mapped[date | None] = mapped_column(Date)
+    date_range_end: Mapped[date | None] = mapped_column(Date)
+    warnings: Mapped[list[Any] | None] = mapped_column(JSONB)
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+    broker_account: Mapped["BrokerAccount"] = relationship(back_populates="import_runs")
+
+    __table_args__ = (
+        UniqueConstraint("broker_account_id", "file_hash", name="uq_import_run_account_filehash"),
+    )
+
+
+class HistoricalTrade(TimestampMixin, Base):
+    __tablename__ = "historical_trades"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    isin: Mapped[str | None] = mapped_column(String(20))
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
+    )
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    trade_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    side: Mapped[str] = mapped_column(String(4), nullable=False)  # BUY|SELL
+    quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    exchange: Mapped[str | None] = mapped_column(String(10))
+    segment: Mapped[str | None] = mapped_column(String(20))
+    product: Mapped[str | None] = mapped_column(String(10))
+    order_id: Mapped[str | None] = mapped_column(String(50))
+    charges: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    source_import_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("historical_import_runs.id")
+    )
+    raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    broker_account: Mapped["BrokerAccount"] = relationship(back_populates="trades")
+    company: Mapped["Company | None"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "broker_account_id", "dedupe_key", name="uq_historical_trade_account_dedupe",
+        ),
+    )
+
+
+class HistoricalCashFlow(TimestampMixin, Base):
+    __tablename__ = "historical_cash_flows"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    flow_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    # DEPOSIT|WITHDRAWAL|CHARGE|OTHER
+    flow_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    source_import_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("historical_import_runs.id")
+    )
+    raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    broker_account: Mapped["BrokerAccount"] = relationship(back_populates="cash_flows")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "broker_account_id", "dedupe_key", name="uq_historical_cashflow_account_dedupe",
+        ),
+    )
+
+
+class HistoricalDividend(TimestampMixin, Base):
+    __tablename__ = "historical_dividends"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    isin: Mapped[str | None] = mapped_column(String(20))
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
+    )
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    quantity_held: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    source_import_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("historical_import_runs.id")
+    )
+    raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    broker_account: Mapped["BrokerAccount"] = relationship(back_populates="dividends")
+    company: Mapped["Company | None"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "broker_account_id", "dedupe_key", name="uq_historical_dividend_account_dedupe",
+        ),
+    )
+
+
+class HistoricalPositionLot(TimestampMixin, Base):
+    """Output of Phase 6B FIFO lot reconstruction. Not written by
+    importers -- declared now so the reconstruction service and the
+    importer's dedupe-key vocabulary are settled together. Rebuilt
+    wholesale (not incrementally patched) whenever reconstruction reruns
+    for an account, since a single new historical trade can change every
+    downstream lot's cost basis.
+    """
+
+    __tablename__ = "historical_position_lots"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
+    )
+    opened_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    quantity_opened: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    quantity_remaining: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    cost_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    closed_date: Mapped[date | None] = mapped_column(Date, index=True)
+    realized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    opening_trade_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("historical_trades.id")
+    )
+
+    broker_account: Mapped["BrokerAccount"] = relationship()
+    company: Mapped["Company | None"] = relationship()
+
+
+class OpeningPositionAdjustment(TimestampMixin, Base):
+    """A reconciliation-derived synthetic opening lot for a symbol whose
+    real acquisition trade(s) are missing from the tradebook history (e.g.
+    ZAGGLE: the earliest known activity is a SELL with no prior BUY).
+    Applied during FIFO replay as a synthetic BUY dated at opening_date,
+    so downstream FIFO math stays coherent -- never fabricated silently;
+    source/confidence/reason are always surfaced in reconstruction
+    warnings and reconciliation output.
+    """
+
+    __tablename__ = "opening_position_adjustments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    isin: Mapped[str | None] = mapped_column(String(20))
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
+    )
+    opening_date: Mapped[date] = mapped_column(Date, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    cost_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    source: Mapped[str] = mapped_column(String(255), nullable=False)  # e.g. ZERODHA_PNL_RECONCILIATION
+    confidence: Mapped[str] = mapped_column(String(10), nullable=False)  # LOW | MEDIUM | HIGH
+    reason: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g. MISSING_TRADE_HISTORY
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    broker_account: Mapped["BrokerAccount"] = relationship()
+    company: Mapped["Company | None"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "broker_account_id", "symbol", name="uq_opening_position_adjustment_account_symbol",
+        ),
+    )
+
+
+# ── Historical market prices (Phase 6C.0) ────────────────────────────────────
+
+class PriceArchiveFile(TimestampMixin, Base):
+    """The Tier-1 archive for a single downloaded market-wide price file
+    (one NSE equity bhavcopy or one NSE Indices close-all file for one
+    trading_date). NOT the same table as SourceDocument: SourceDocument is
+    strictly company-scoped (company_id is NOT NULL there), but a bhavcopy
+    file covers every listed equity in one day -- forcing it under a single
+    company would either duplicate the same bytes once per company ingested
+    from it, or misattribute a market-wide file as "belonging" to one
+    company. This table is deliberately not company-scoped; DailyPrice/
+    BenchmarkPrice rows for many different symbols/dates can all point at
+    the same PriceArchiveFile row.
+    """
+
+    __tablename__ = "price_archive_files"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    data_type: Mapped[str] = mapped_column(String(20), nullable=False)  # EQUITY_BHAVCOPY|INDEX_BHAVCOPY
+    # NSE_CM_UDIFF|NSE_CM_LEGACY|NSE_INDICES_CLOSE_ALL
+    source_format: Mapped[str] = mapped_column(String(30), nullable=False)
+    trading_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # sha256
+    storage_path: Mapped[str] = mapped_column(Text, nullable=False)
+    mime_type: Mapped[str | None] = mapped_column(String(100))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "trading_date", "data_type", "content_hash",
+            name="uq_price_archive_file_date_type_hash",
+        ),
+    )
+
+
+class DailyPrice(TimestampMixin, Base):
+    """One equity's raw (never adjusted) daily OHLCV bar, deterministically
+    parsed from an archived NSE bhavcopy file. adjustment_status is always
+    "RAW" today -- no split/bonus adjustment is ever inferred here; that is
+    Phase 6B's corporate_actions table's job, kept as a separate concern."""
+
+    __tablename__ = "daily_prices"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    trading_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    open: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    volume: Mapped[int | None] = mapped_column(BigInteger)
+    source: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g. NSE_BHAVCOPY
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("price_archive_files.id"), index=True
+    )
+    adjustment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="RAW")
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    company: Mapped["Company"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "trading_date", name="uq_daily_price_symbol_date"),
+    )
+
+
+class BenchmarkPrice(TimestampMixin, Base):
+    """One benchmark index's raw daily OHLC bar (e.g. NIFTY 50 price index),
+    deterministically parsed from an archived NSE Indices close-all file.
+    benchmark_code is a fixed internal vocabulary (e.g. "NIFTY_50") so a
+    later NIFTY 50 TRI series can be added as "NIFTY_50_TRI" without
+    touching this table's shape."""
+
+    __tablename__ = "benchmark_prices"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    benchmark_code: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    trading_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    open: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    source: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g. NSE_INDICES_CLOSE_ALL
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("price_archive_files.id"), index=True
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("benchmark_code", "trading_date", name="uq_benchmark_price_code_date"),
+    )
+
+
+# ── Phase 6C: walk-forward simulation ────────────────────────────────────────
+# Given a historical decision date T, reconstruct what was known at T (via
+# Phase 6B's get_portfolio_as_of with feature_cutoff_at=T), freeze a decision,
+# then score it against future DailyPrice/BenchmarkPrice rows. freeze_decision
+# never touches price repositories at all -- score_outcome is the only code
+# path in this feature that does, so future-price leakage is a structural
+# impossibility rather than a convention (see services/walkforward/).
+
+class WalkForwardRun(TimestampMixin, Base):
+    """One batch of walk-forward decisions/outcomes for a broker account,
+    e.g. one `walk-forward-run` CLI invocation covering several
+    (symbol, decision_date) pairs. strategy_profile is denormalized from
+    BrokerAccount so reporting doesn't require a join."""
+
+    __tablename__ = "walk_forward_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id"), index=True, nullable=False
+    )
+    strategy_profile: Mapped[str] = mapped_column(String(20), nullable=False)  # LONG_TERM | MEDIUM_TERM
+    horizons_months: Mapped[list[int]] = mapped_column(JSONB, nullable=False)
+    model_version: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+
+class WalkForwardDecision(Base):
+    """One frozen decision for one symbol as of one decision_at, from one of
+    three distinct sources (never conflated): ACTUAL (what the investor
+    really did, derived from HistoricalTrade rows on decision_at), HOLD_BASELINE
+    (the counterfactual "do nothing", action is always HOLD by construction),
+    or AGENT (a deterministic recommendation, only ever written once a
+    generator exists -- v1 does not build one).
+
+    Immutable once created: no repository update method is offered, and
+    frozen_at plus the (run_id, symbol, decision_at, decision_source) unique
+    constraint make re-freezing a no-op rather than a mutation.
+
+    quantity_held/average_cost/invested_capital and reconstruction_warnings
+    are captured from the Phase 6B snapshot at freeze time -- this row never
+    re-queries reconstruction later, so its data-quality status can never
+    drift out from under an already-scored outcome.
+    """
+
+    __tablename__ = "walk_forward_decisions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("walk_forward_runs.id"), index=True, nullable=False
+    )
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("broker_accounts.id"), index=True, nullable=False
+    )
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    decision_at: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    feature_cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # ACTUAL | HOLD_BASELINE | AGENT
+    decision_source: Mapped[str] = mapped_column(String(20), nullable=False)
+    # BUY | ADD | HOLD | REDUCE | EXIT
+    action: Mapped[str] = mapped_column(String(10), nullable=False)
+    # Only meaningful for decision_source=AGENT; None for ACTUAL/HOLD_BASELINE.
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    reasoning: Mapped[str | None] = mapped_column(Text)
+    # list[{"type": "historical_trade", "id": str}, ...]
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    quantity_held: Mapped[Decimal] = mapped_column(Numeric(20, 4), nullable=False)
+    average_cost: Mapped[Decimal] = mapped_column(Numeric(20, 4), nullable=False)
+    invested_capital: Mapped[Decimal] = mapped_column(Numeric(20, 4), nullable=False)
+    # Reconstruction warnings mentioning this symbol, captured verbatim from
+    # PortfolioSnapshotAsOf.warnings at freeze time.
+    reconstruction_warnings: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    # CLEAN | RECONSTRUCTION_WARNING
+    data_quality_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    frozen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "symbol", "decision_at", "decision_source",
+            name="uq_walk_forward_decision_run_symbol_date_source",
+        ),
+    )
+
+
+class WalkForwardOutcome(Base):
+    """How one frozen WalkForwardDecision played out, scored strictly after
+    the decision -- this is the only model in the feature ever populated
+    from DailyPrice/BenchmarkPrice rows with trading_date > decision_at.
+
+    Every numeric field is None exactly when it cannot be genuinely computed
+    (missing price, unresolved corporate action, horizon beyond available
+    data) -- never fabricated, matching EstimateRun/BacktestScore's existing
+    never-guess discipline. data_quality_notes carries the per-horizon reason
+    for any None field.
+
+    price_Nm_date is the actual nearest trading day used to resolve each
+    horizon (target dates routinely land on a weekend/holiday), kept
+    alongside price_Nm so a report can show exactly which day was scored.
+    """
+
+    __tablename__ = "walk_forward_outcomes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    decision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("walk_forward_decisions.id"), unique=True, nullable=False
+    )
+    entry_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    entry_price_date: Mapped[date | None] = mapped_column(Date)
+    price_1m: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    price_3m: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    price_6m: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    price_12m: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    price_1m_date: Mapped[date | None] = mapped_column(Date)
+    price_3m_date: Mapped[date | None] = mapped_column(Date)
+    price_6m_date: Mapped[date | None] = mapped_column(Date)
+    price_12m_date: Mapped[date | None] = mapped_column(Date)
+    stock_return_1m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    stock_return_3m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    stock_return_6m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    stock_return_12m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    benchmark_return_1m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    benchmark_return_3m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    benchmark_return_6m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    benchmark_return_12m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_1m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_3m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_6m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    excess_return_12m: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    max_drawdown_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    # SCORED | PARTIAL | UNSCORABLE
+    outcome_status: Mapped[str] = mapped_column(String(12), nullable=False)
+    # Per-horizon reasons for any None field, e.g. "3M: DATA_GAP no EQ-series
+    # price within 10 days of 2021-09-15".
+    data_quality_notes: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

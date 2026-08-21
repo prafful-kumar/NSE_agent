@@ -18,11 +18,14 @@ correctly end up with a sparse/empty history and a low-confidence,
 mostly-None estimate rather than a fabricated one.
 """
 
+import hashlib
 import uuid
+from collections.abc import Iterable
 from datetime import datetime
 
 from sqlalchemy import select
 
+from investing_agent.config.logging import get_logger
 from investing_agent.db.models import Catalyst, FeatureSnapshot, FinancialPeriod, RiskObservation
 from investing_agent.db.repositories.company_research import (
     ManagementGuidanceRepository,
@@ -51,14 +54,37 @@ from investing_agent.schemas.estimation import (
 _MAX_RECENT_NEWS = 20
 _SCOPE_PREFERENCE = ("CONSOLIDATED", "STANDALONE", "UNRESOLVED")
 
+# Bump whenever a _build_* function's semantics change in a way that could
+# alter a snapshot's payload for the same underlying records (e.g. a new
+# filter, a new data source folded into the fingerprint) — this forces every
+# cached snapshot to rebuild rather than being served under stale semantics.
+FEATURE_BUILDER_VERSION = "features-v2"
+
+_RecordIdentity = tuple[uuid.UUID, datetime]
+
+logger = get_logger(__name__)
+
+
+def _fingerprint(*id_groups: Iterable[_RecordIdentity]) -> str:
+    """Deterministic hash over every record that fed the payload. Two calls
+    with the same underlying (id, updated_at) pairs always hash identically
+    regardless of query order; any new/changed/removed record — including a
+    newly-transcribed historical result becoming visible at an unchanged
+    cutoff_at — changes the hash, which is exactly what forces
+    FeatureSnapshotRepository.get_or_create to build a fresh row instead of
+    reusing a stale one."""
+    parts = sorted(
+        f"{record_id}:{updated_at.isoformat()}"
+        for group in id_groups
+        for record_id, updated_at in group
+    )
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
 
 async def build_feature_snapshot(
     session, company_id: uuid.UUID, financial_period_id: uuid.UUID, cutoff_at: datetime
 ) -> FeatureSnapshot:
     snapshot_repo = FeatureSnapshotRepository(session)
-    existing = await snapshot_repo.get_by_key(company_id, financial_period_id, cutoff_at)
-    if existing is not None:
-        return existing
 
     target_period = await session.get(FinancialPeriod, financial_period_id)
     if target_period is None:
@@ -72,16 +98,26 @@ async def build_feature_snapshot(
         label=target_period.label,
     )
 
+    # The full qualifying point-in-time input set is always built fresh —
+    # cache reuse is decided afterward, by comparing the fingerprint of what
+    # was just built against what a prior snapshot for this key was built
+    # from (see get_or_create). This is what makes the cache safe against
+    # newly-transcribed history appearing at an already-cached cutoff.
     (
         historical_financials,
         used_unresolved_scope,
         verified_history_count,
         unverified_history_count,
+        financial_result_ids,
     ) = await _build_historical_financials(session, company_id, target_period, cutoff_at)
-    order_book = await _build_order_book(session, company_id, cutoff_at)
-    guidance = await _build_guidance(session, company_id, target_period.fiscal_year, cutoff_at)
-    segment_metrics = await _build_segment_metrics(session, company_id, cutoff_at)
-    operational_metrics = await _build_operational_metrics(session, company_id, cutoff_at)
+    order_book, order_book_ids = await _build_order_book(session, company_id, cutoff_at)
+    guidance, guidance_ids = await _build_guidance(
+        session, company_id, target_period.fiscal_year, cutoff_at
+    )
+    segment_metrics, segment_metric_ids = await _build_segment_metrics(session, company_id, cutoff_at)
+    operational_metrics, operational_metric_ids = await _build_operational_metrics(
+        session, company_id, cutoff_at
+    )
     active_catalysts = await _build_active_catalysts(session, company_id, cutoff_at)
     active_risks = await _build_active_risks(session, company_id, cutoff_at)
     recent_news = await _build_recent_news(session, company_id, cutoff_at)
@@ -101,21 +137,37 @@ async def build_feature_snapshot(
         unverified_history_count=unverified_history_count,
     )
 
-    return await snapshot_repo.get_or_create(
+    input_fingerprint = _fingerprint(
+        financial_result_ids, order_book_ids, guidance_ids, segment_metric_ids, operational_metric_ids
+    )
+
+    snapshot_row, reused = await snapshot_repo.get_or_create(
         FeatureSnapshotCreate(
             company_id=company_id,
             financial_period_id=financial_period_id,
             cutoff_at=cutoff_at,
             payload=payload.model_dump(mode="json"),
+            input_fingerprint=input_fingerprint,
+            feature_builder_version=FEATURE_BUILDER_VERSION,
         )
     )
+    logger.info(
+        "feature_snapshot_built",
+        company_id=str(company_id),
+        financial_period_id=str(financial_period_id),
+        cutoff_at=cutoff_at.isoformat(),
+        snapshot_reused=reused,
+        input_fingerprint=input_fingerprint,
+        verified_history_count=verified_history_count,
+    )
+    return snapshot_row
 
 
 async def _build_historical_financials(
     session, company_id: uuid.UUID, target_period: FinancialPeriod, cutoff_at: datetime
-) -> tuple[list[HistoricalFinancialPoint], bool, int, int]:
+) -> tuple[list[HistoricalFinancialPoint], bool, int, int, list[_RecordIdentity]]:
     """Returns (points, used_unresolved_scope, verified_history_count,
-    unverified_history_count).
+    unverified_history_count, record_ids).
 
     Only verification_status=="verified" rows ever become a
     HistoricalFinancialPoint — an unreconciled NSE JSON-hint row
@@ -185,29 +237,37 @@ async def _build_historical_financials(
                 break
 
     points.sort(key=lambda p: p.period_end)
-    return points, used_unresolved_scope, verified_history_count, unverified_history_count
+    record_ids = [(r.id, r.updated_at) for rows in by_period.values() for _period, r in rows]
+    return points, used_unresolved_scope, verified_history_count, unverified_history_count, record_ids
 
 
-async def _build_order_book(session, company_id: uuid.UUID, cutoff_at: datetime) -> OrderBookPoint | None:
+async def _build_order_book(
+    session, company_id: uuid.UUID, cutoff_at: datetime
+) -> tuple[OrderBookPoint | None, list[_RecordIdentity]]:
     rows = await OrderBookSnapshotRepository(session).list_by_company_as_of(company_id, cutoff_at)
+    record_ids = [(r.id, r.updated_at) for r in rows]
     if not rows:
-        return None
+        return None, record_ids
     latest = rows[0]
-    return OrderBookPoint(
-        as_of_date=latest.as_of_date,
-        order_book_value=latest.order_book_value,
-        currency=latest.currency,
-        unit_scale=latest.unit_scale,
-        book_to_bill_ratio=latest.book_to_bill_ratio,
-        expected_execution_period=latest.expected_execution_period,
+    return (
+        OrderBookPoint(
+            as_of_date=latest.as_of_date,
+            order_book_value=latest.order_book_value,
+            currency=latest.currency,
+            unit_scale=latest.unit_scale,
+            book_to_bill_ratio=latest.book_to_bill_ratio,
+            expected_execution_period=latest.expected_execution_period,
+        ),
+        record_ids,
     )
 
 
 async def _build_guidance(
     session, company_id: uuid.UUID, target_fiscal_year: int, cutoff_at: datetime
-) -> list[GuidancePoint]:
+) -> tuple[list[GuidancePoint], list[_RecordIdentity]]:
     rows = await ManagementGuidanceRepository(session).list_by_company_as_of(company_id, cutoff_at)
-    return [
+    matching = [g for g in rows if g.fiscal_year == target_fiscal_year]
+    points = [
         GuidancePoint(
             fiscal_year=g.fiscal_year,
             guidance_type=g.guidance_type,
@@ -217,32 +277,36 @@ async def _build_guidance(
             guidance_high=g.guidance_high,
             period_label=g.period_label,
         )
-        for g in rows
-        if g.fiscal_year == target_fiscal_year
+        for g in matching
     ]
+    return points, [(g.id, g.updated_at) for g in matching]
 
 
-async def _build_segment_metrics(session, company_id: uuid.UUID, cutoff_at: datetime) -> list[SegmentMetricPoint]:
+async def _build_segment_metrics(
+    session, company_id: uuid.UUID, cutoff_at: datetime
+) -> tuple[list[SegmentMetricPoint], list[_RecordIdentity]]:
     rows = await SegmentMetricRepository(session).list_by_company_as_of(company_id, cutoff_at)
-    return [
+    points = [
         SegmentMetricPoint(
             segment_name=m.segment_name, metric_type=m.metric_type,
             value=m.value, unit_scale=m.unit_scale,
         )
         for m in rows
     ]
+    return points, [(m.id, m.updated_at) for m in rows]
 
 
 async def _build_operational_metrics(
     session, company_id: uuid.UUID, cutoff_at: datetime
-) -> list[OperationalMetricPoint]:
+) -> tuple[list[OperationalMetricPoint], list[_RecordIdentity]]:
     rows = await OperationalMetricRepository(session).list_by_company_as_of(company_id, cutoff_at)
-    return [
+    points = [
         OperationalMetricPoint(
             metric_name=m.metric_name, value=m.value, unit=m.unit, as_of_date=m.as_of_date,
         )
         for m in rows
     ]
+    return points, [(m.id, m.updated_at) for m in rows]
 
 
 async def _build_active_catalysts(session, company_id: uuid.UUID, cutoff_at: datetime) -> list[CatalystPoint]:

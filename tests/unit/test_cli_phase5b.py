@@ -157,10 +157,14 @@ class TestBacktestReportCommand:
             patch("investing_agent.db.session.AsyncSessionLocal", _fake_session_factory(session)),
             patch("investing_agent.db.repositories.company.CompanyRepository") as company_repo_cls,
             patch(
+                "investing_agent.db.repositories.financial.FinancialPeriodRepository"
+            ) as period_repo_cls,
+            patch(
                 "investing_agent.db.repositories.backtesting.BacktestScoreRepository"
             ) as score_repo_cls,
         ):
             company_repo_cls.return_value.list = AsyncMock(return_value=[])
+            period_repo_cls.return_value.list = AsyncMock(return_value=[])
             score_repo_cls.return_value.list_all = AsyncMock(return_value=[])
 
             result = CliRunner().invoke(cli, ["backtest-report"])
@@ -186,10 +190,14 @@ class TestBacktestReportCommand:
             patch("investing_agent.db.session.AsyncSessionLocal", _fake_session_factory(session)),
             patch("investing_agent.db.repositories.company.CompanyRepository") as company_repo_cls,
             patch(
+                "investing_agent.db.repositories.financial.FinancialPeriodRepository"
+            ) as period_repo_cls,
+            patch(
                 "investing_agent.db.repositories.backtesting.BacktestScoreRepository"
             ) as score_repo_cls,
         ):
             company_repo_cls.return_value.list = AsyncMock(return_value=[company])
+            period_repo_cls.return_value.list = AsyncMock(return_value=[])
             score_repo_cls.return_value.list_all = AsyncMock(return_value=rows)
 
             result = CliRunner().invoke(cli, ["backtest-report"])
@@ -218,10 +226,14 @@ class TestBacktestReportCommand:
             patch("investing_agent.db.session.AsyncSessionLocal", _fake_session_factory(session)),
             patch("investing_agent.db.repositories.company.CompanyRepository") as company_repo_cls,
             patch(
+                "investing_agent.db.repositories.financial.FinancialPeriodRepository"
+            ) as period_repo_cls,
+            patch(
                 "investing_agent.db.repositories.backtesting.BacktestScoreRepository"
             ) as score_repo_cls,
         ):
             company_repo_cls.return_value.list = AsyncMock(return_value=[defence_co, it_co])
+            period_repo_cls.return_value.list = AsyncMock(return_value=[])
             score_repo_cls.return_value.list_all = AsyncMock(return_value=rows)
 
             result = CliRunner().invoke(cli, ["backtest-report", "--sector", "Defence"])
@@ -246,10 +258,14 @@ class TestBacktestReportCommand:
             ),
             patch("investing_agent.db.repositories.company.CompanyRepository") as company_repo_cls,
             patch(
+                "investing_agent.db.repositories.financial.FinancialPeriodRepository"
+            ) as period_repo_cls,
+            patch(
                 "investing_agent.db.repositories.backtesting.BacktestScoreRepository"
             ) as score_repo_cls,
         ):
             company_repo_cls.return_value.list = AsyncMock(return_value=[company, other])
+            period_repo_cls.return_value.list = AsyncMock(return_value=[])
             score_repo_cls.return_value.list_all = AsyncMock(return_value=rows)
 
             result = CliRunner().invoke(cli, ["backtest-report", "--symbol", "BEL"])

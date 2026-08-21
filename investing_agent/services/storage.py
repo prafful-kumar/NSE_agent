@@ -24,6 +24,7 @@ _EXTENSION_BY_DOCUMENT_TYPE = {
     "json": "json",
     "txt": "txt",
     "zip": "zip",
+    "csv": "csv",
 }
 
 

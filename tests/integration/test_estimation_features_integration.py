@@ -449,3 +449,228 @@ class TestHistoricalAvailableAtIsNotIngestionTime:
 
         cutoff_at = earliest_available_at - timedelta(seconds=1)
         assert cutoff_at.year == 2025
+
+
+async def _upsert_verified_result(
+    db_session,
+    *,
+    company,
+    period,
+    available_at: datetime,
+    revenue: Decimal = Decimal("1000"),
+    source_type: str = "nse_filing_pdf",
+):
+    from investing_agent.db.repositories.financial import FinancialResultRepository
+
+    result_repo = FinancialResultRepository(db_session)
+    row, _ = await result_repo.upsert_versioned(
+        FinancialResultCreate(
+            period_id=period.id, company_id=company.id, symbol=company.symbol,
+            statement_scope="CONSOLIDATED", reporting_basis="QUARTER", is_audited=True,
+            result_date=period.period_end, currency="INR", unit_scale="CRORE",
+            revenue=revenue, ebitda=None, ebitda_margin_pct=Decimal("12"),
+            ebitda_source=None, pbt=None, pat=Decimal("84"), pat_margin_pct=None,
+            eps_basic=None, eps_diluted=Decimal("5"), total_debt=None,
+            cash_equivalents=None, operating_cash_flow=None, roe_pct=None, roce_pct=None,
+            other_metrics={}, source_type=source_type, source_url=None,
+            published_at=available_at, available_at=available_at,
+            data_category="fact", confidence=None, source_document_id=None,
+            verification_status="verified",
+        )
+    )
+    await db_session.flush()
+    return row
+
+
+class TestFeatureSnapshotCacheInvalidation:
+    """Regression coverage for the real BEL staleness bug: build_feature_snapshot
+    used to be content-addressed only by (company_id, financial_period_id,
+    cutoff_at), so a snapshot cached before a historical quarter was
+    transcribed would be served forever after, even once the newly-verified
+    FinancialResult became visible at that same cutoff_at. See
+    services/estimation/features.py::_fingerprint and
+    db/repositories/estimation.py::FeatureSnapshotRepository.get_matching."""
+
+    async def test_new_older_verified_result_invalidates_cache_and_rebuilds(
+        self, db_session, company, target_period
+    ) -> None:
+        from investing_agent.db.repositories.financial import FinancialPeriodRepository
+
+        period_repo = FinancialPeriodRepository(db_session)
+        q2 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q2", date(2025, 9, 30), "Q2FY26"
+        )
+        await _upsert_verified_result(
+            db_session, company=company, period=q2,
+            available_at=datetime(2025, 10, 15, tzinfo=UTC),
+        )
+
+        cutoff = datetime(2025, 11, 1, tzinfo=UTC)
+        first = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+        first_payload = FeatureSnapshotPayload(**first.payload)
+        assert first_payload.verified_history_count == 1
+
+        # A quarter earlier than Q2FY26, whose available_at nonetheless
+        # predates the cutoff -- exactly the "newly-transcribed older
+        # history became visible at an already-cached cutoff" scenario.
+        q1 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q1", date(2025, 6, 30), "Q1FY26"
+        )
+        await _upsert_verified_result(
+            db_session, company=company, period=q1,
+            available_at=datetime(2025, 7, 15, tzinfo=UTC),
+        )
+
+        second = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+        second_payload = FeatureSnapshotPayload(**second.payload)
+
+        assert second.id != first.id
+        assert second_payload.verified_history_count == 2
+        assert second.input_fingerprint != first.input_fingerprint
+
+    async def test_future_available_at_result_does_not_invalidate_cache(
+        self, db_session, company, target_period
+    ) -> None:
+        from investing_agent.db.repositories.financial import FinancialPeriodRepository
+
+        period_repo = FinancialPeriodRepository(db_session)
+        q2 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q2", date(2025, 9, 30), "Q2FY26"
+        )
+        await _upsert_verified_result(
+            db_session, company=company, period=q2,
+            available_at=datetime(2025, 10, 15, tzinfo=UTC),
+        )
+
+        cutoff = datetime(2025, 11, 1, tzinfo=UTC)
+        first = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+
+        q1 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q1", date(2025, 6, 30), "Q1FY26"
+        )
+        # available_at is AFTER cutoff -- not yet visible as of cutoff, so
+        # it must not have been part of the PIT query and must not affect
+        # the fingerprint.
+        await _upsert_verified_result(
+            db_session, company=company, period=q1,
+            available_at=datetime(2025, 12, 1, tzinfo=UTC),
+        )
+
+        second = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+
+        assert second.id == first.id
+
+    async def test_identical_reingestion_does_not_invalidate_cache(
+        self, db_session, company, target_period
+    ) -> None:
+        from investing_agent.db.repositories.financial import FinancialPeriodRepository
+
+        period_repo = FinancialPeriodRepository(db_session)
+        q2 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q2", date(2025, 9, 30), "Q2FY26"
+        )
+        available_at = datetime(2025, 10, 15, tzinfo=UTC)
+        await _upsert_verified_result(db_session, company=company, period=q2, available_at=available_at)
+
+        cutoff = datetime(2025, 11, 1, tzinfo=UTC)
+        first = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+
+        # Re-ingesting the exact same reported values (same period/scope/
+        # basis/source_type/available_at) hits upsert_versioned's
+        # _values_equal branch -- same row, no version bump -- so the
+        # fingerprint must be unchanged and the cache reused.
+        await _upsert_verified_result(db_session, company=company, period=q2, available_at=available_at)
+
+        second = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+
+        assert second.id == first.id
+
+    async def test_revised_qualifying_result_invalidates_cache(
+        self, db_session, company, target_period
+    ) -> None:
+        from investing_agent.db.repositories.financial import FinancialPeriodRepository
+
+        period_repo = FinancialPeriodRepository(db_session)
+        q2 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q2", date(2025, 9, 30), "Q2FY26"
+        )
+        available_at = datetime(2025, 10, 15, tzinfo=UTC)
+        await _upsert_verified_result(
+            db_session, company=company, period=q2, available_at=available_at, revenue=Decimal("1000")
+        )
+
+        cutoff = datetime(2025, 11, 1, tzinfo=UTC)
+        first = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+
+        # A genuine restatement -- same period/scope/basis/source_type but a
+        # different reported value -- creates a brand-new versioned row
+        # (upsert_versioned's version+1 branch), which must invalidate.
+        await _upsert_verified_result(
+            db_session, company=company, period=q2, available_at=available_at, revenue=Decimal("1100")
+        )
+
+        second = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+        second_payload = FeatureSnapshotPayload(**second.payload)
+
+        assert second.id != first.id
+        assert second.input_fingerprint != first.input_fingerprint
+        assert second_payload.historical_financials[0].revenue == Decimal("1100")
+
+    async def test_old_estimate_run_still_references_its_original_immutable_snapshot(
+        self, db_session, company, target_period
+    ) -> None:
+        from investing_agent.db.models import FeatureSnapshot
+        from investing_agent.db.repositories.estimation import EstimateRunRepository
+        from investing_agent.db.repositories.financial import FinancialPeriodRepository
+        from investing_agent.schemas.estimation import EstimateRunCreate
+
+        period_repo = FinancialPeriodRepository(db_session)
+        q2 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q2", date(2025, 9, 30), "Q2FY26"
+        )
+        await _upsert_verified_result(
+            db_session, company=company, period=q2,
+            available_at=datetime(2025, 10, 15, tzinfo=UTC),
+        )
+
+        cutoff = datetime(2025, 11, 1, tzinfo=UTC)
+        first = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+        first_payload = FeatureSnapshotPayload(**first.payload)
+
+        estimate_run = await EstimateRunRepository(db_session).create(
+            EstimateRunCreate(
+                company_id=company.id, financial_period_id=target_period.id, cutoff_at=cutoff,
+                model_version="deterministic-v1", feature_snapshot_id=first.id,
+                revenue_base=Decimal("110.00"), confidence=Decimal("0.60"),
+            )
+        )
+        await db_session.flush()
+
+        q1 = await period_repo.get_or_create(
+            company.id, "quarter", 2026, "Q1", date(2025, 6, 30), "Q1FY26"
+        )
+        await _upsert_verified_result(
+            db_session, company=company, period=q1,
+            available_at=datetime(2025, 7, 15, tzinfo=UTC),
+        )
+
+        second = await build_feature_snapshot(db_session, company.id, target_period.id, cutoff)
+        await db_session.flush()
+        assert second.id != first.id
+
+        # The old EstimateRun's FK is untouched, and the row it points at
+        # still holds its original payload -- never mutated in place.
+        assert estimate_run.feature_snapshot_id == first.id
+        original = await db_session.get(FeatureSnapshot, first.id)
+        assert original is not None
+        original_payload = FeatureSnapshotPayload(**original.payload)
+        assert original_payload.verified_history_count == first_payload.verified_history_count == 1

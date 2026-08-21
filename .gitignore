@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Local auth/session state (never commit tokens)
+.local/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -39,6 +42,9 @@ logs/
 *.db
 *.sqlite
 /data/
+
+# Real broker statement exports (personal financial data -- never commit)
+/statements/
 
 # Docker
 docker-compose.override.yml

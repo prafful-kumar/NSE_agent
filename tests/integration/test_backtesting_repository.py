@@ -60,7 +60,7 @@ async def period(db_session, company):
 async def estimate_run(db_session, company, period):
     from investing_agent.db.repositories.estimation import EstimateRunRepository, FeatureSnapshotRepository
 
-    snapshot = await FeatureSnapshotRepository(db_session).get_or_create(
+    snapshot, _ = await FeatureSnapshotRepository(db_session).get_or_create(
         FeatureSnapshotCreate(
             company_id=company.id, financial_period_id=period.id, cutoff_at=CUTOFF,
             payload={"target_period": {"fiscal_year": 2026}},

@@ -18,23 +18,59 @@ class FeatureSnapshotRepository(BaseRepository[FeatureSnapshot]):
     async def get_by_key(
         self, company_id: uuid.UUID, financial_period_id: uuid.UUID, cutoff_at: datetime
     ) -> FeatureSnapshot | None:
+        """Most recently created snapshot for this (company, period, cutoff)
+        triple, regardless of input_fingerprint. For display/lookup only —
+        not for cache-reuse decisions (multiple snapshots with different
+        fingerprints can share this triple; see get_matching)."""
+        result = await self.session.execute(
+            select(FeatureSnapshot)
+            .where(
+                FeatureSnapshot.company_id == company_id,
+                FeatureSnapshot.financial_period_id == financial_period_id,
+                FeatureSnapshot.cutoff_at == cutoff_at,
+            )
+            .order_by(FeatureSnapshot.created_at.desc())
+        )
+        return result.scalars().first()
+
+    async def get_matching(
+        self,
+        company_id: uuid.UUID,
+        financial_period_id: uuid.UUID,
+        cutoff_at: datetime,
+        input_fingerprint: str,
+        feature_builder_version: str,
+    ) -> FeatureSnapshot | None:
+        """The snapshot to reuse: same key AND built from the exact same
+        underlying qualifying records. A different input_fingerprint (e.g.
+        newly-transcribed history became visible at this cutoff since the
+        cached row was built) never matches here, so get_or_create below
+        creates a fresh row instead of serving stale data."""
         result = await self.session.execute(
             select(FeatureSnapshot).where(
                 FeatureSnapshot.company_id == company_id,
                 FeatureSnapshot.financial_period_id == financial_period_id,
                 FeatureSnapshot.cutoff_at == cutoff_at,
+                FeatureSnapshot.input_fingerprint == input_fingerprint,
+                FeatureSnapshot.feature_builder_version == feature_builder_version,
             )
         )
         return result.scalar_one_or_none()
 
-    async def get_or_create(self, data: FeatureSnapshotCreate) -> FeatureSnapshot:
-        existing = await self.get_by_key(
-            data.company_id, data.financial_period_id, data.cutoff_at
+    async def get_or_create(self, data: FeatureSnapshotCreate) -> tuple[FeatureSnapshot, bool]:
+        """Returns (row, reused). reused=True means an existing snapshot
+        built from the exact same input_fingerprint was found and returned
+        as-is; reused=False means a new row was just inserted — the caller
+        (build_feature_snapshot) uses this for cache-invalidation
+        diagnostics."""
+        existing = await self.get_matching(
+            data.company_id, data.financial_period_id, data.cutoff_at,
+            data.input_fingerprint, data.feature_builder_version,
         )
         if existing is not None:
-            return existing
+            return existing, True
         row = FeatureSnapshot(**data.model_dump())
-        return await self.add(row)
+        return await self.add(row), False
 
 
 class EstimateRunRepository(BaseRepository[EstimateRun]):

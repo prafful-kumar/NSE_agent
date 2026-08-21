@@ -649,6 +649,162 @@ async def _verify_financial_result(
         )
 
 
+@cli.command("record-historical-financial-result")
+@click.argument("symbol")
+@click.option("--quarter", required=True, help="Target quarter, e.g. Q3FY22")
+@click.option(
+    "--scope", default="STANDALONE",
+    type=click.Choice(["STANDALONE", "CONSOLIDATED", "UNRESOLVED"]),
+)
+@click.option(
+    "--basis", default="QUARTER", type=click.Choice(["QUARTER", "YTD", "ANNUAL"])
+)
+@click.option(
+    "--source-document-id", required=True,
+    help="Archived primary document this was transcribed from — see show-filings",
+)
+@click.option("--source-page", type=int, default=None)
+@click.option("--source-quote", default=None, help="Short excerpt copied from the P&L table")
+@click.option("--is-audited/--unaudited", default=True)
+@click.option(
+    "--unit-scale", default="LAKH", type=click.Choice(["LAKH", "CRORE", "ACTUAL", "UNRESOLVED"])
+)
+@click.option("--revenue", default=None, type=Decimal, help="Total income, as disclosed")
+@click.option("--pbt", default=None, type=Decimal)
+@click.option("--pat", default=None, type=Decimal)
+@click.option("--eps-basic", default=None, type=Decimal)
+@click.option("--eps-diluted", default=None, type=Decimal)
+@click.option("--tax-expense", default=None, type=Decimal)
+@click.option("--changes-in-inventories", default=None, type=Decimal)
+@click.option("--employee-cost", default=None, type=Decimal)
+@click.option("--finance-cost", default=None, type=Decimal)
+@click.option("--other-expenses", default=None, type=Decimal)
+def record_historical_financial_result_cmd(
+    symbol: str,
+    quarter: str,
+    scope: str,
+    basis: str,
+    source_document_id: str,
+    source_page: int | None,
+    source_quote: str | None,
+    is_audited: bool,
+    unit_scale: str,
+    revenue: Decimal | None,
+    pbt: Decimal | None,
+    pat: Decimal | None,
+    eps_basic: Decimal | None,
+    eps_diluted: Decimal | None,
+    tax_expense: Decimal | None,
+    changes_in_inventories: Decimal | None,
+    employee_cost: Decimal | None,
+    finance_cost: Decimal | None,
+    other_expenses: Decimal | None,
+) -> None:
+    """Manually transcribe a historical quarterly result for SYMBOL's QUARTER
+    from an archived primary document (older than the structured NSE
+    results-comparison API's 5-quarter window).
+
+    Every figure must come from you having actually read --source-document-id
+    (see show-filings / extract-text) — this command never re-derives them.
+    The row is created already verification_status="verified", since the
+    primary document itself is the evidence.
+    """
+    if revenue is None and pbt is None and pat is None:
+        click.echo("  ERROR: provide at least --revenue/--pbt/--pat", err=True)
+        sys.exit(1)
+    try:
+        fiscal_year, quarter_label = _parse_quarter_arg(quarter)
+    except ValueError as exc:
+        click.echo(f"  {exc}", err=True)
+        sys.exit(1)
+    asyncio.run(
+        _record_historical_financial_result(
+            symbol, fiscal_year, quarter_label, scope, basis,
+            source_document_id, source_page, source_quote, is_audited, unit_scale,
+            revenue, pbt, pat, eps_basic, eps_diluted,
+            tax_expense, changes_in_inventories, employee_cost, finance_cost, other_expenses,
+        )
+    )
+
+
+async def _record_historical_financial_result(
+    symbol: str,
+    fiscal_year: int,
+    quarter_label: str,
+    scope: str,
+    basis: str,
+    source_document_id: str,
+    source_page: int | None,
+    source_quote: str | None,
+    is_audited: bool,
+    unit_scale: str,
+    revenue: Decimal | None,
+    pbt: Decimal | None,
+    pat: Decimal | None,
+    eps_basic: Decimal | None,
+    eps_diluted: Decimal | None,
+    tax_expense: Decimal | None,
+    changes_in_inventories: Decimal | None,
+    employee_cost: Decimal | None,
+    finance_cost: Decimal | None,
+    other_expenses: Decimal | None,
+) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.historical_financials import (
+        HistoricalFinancialTranscriptionError,
+        record_historical_financial_result,
+    )
+    from investing_agent.services.normalization import quarter_label_to_period_end
+
+    period_end = quarter_label_to_period_end(fiscal_year, quarter_label)
+    label = f"{quarter_label}FY{str(fiscal_year)[2:]}"
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        try:
+            outcome = await record_historical_financial_result(
+                session,
+                company_id=company.id,
+                symbol=symbol.upper(),
+                fiscal_year=fiscal_year,
+                quarter=quarter_label,
+                period_end=period_end,
+                period_start=None,
+                period_label=label,
+                statement_scope=scope,
+                reporting_basis=basis,
+                is_audited=is_audited,
+                result_date=None,
+                unit_scale=unit_scale,
+                source_document_id=uuid.UUID(source_document_id),
+                source_page=source_page,
+                source_quote=source_quote,
+                revenue=revenue,
+                pbt=pbt,
+                pat=pat,
+                eps_basic=eps_basic,
+                eps_diluted=eps_diluted,
+                tax_expense=tax_expense,
+                changes_in_inventories=changes_in_inventories,
+                employee_cost=employee_cost,
+                finance_cost=finance_cost,
+                other_expenses=other_expenses,
+            )
+            await session.commit()
+        except HistoricalFinancialTranscriptionError as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    verb = "Created" if outcome.was_new_version else "Unchanged (idempotent)"
+    click.echo(
+        f"\n{verb} — {symbol} {label} ({scope}/{basis}) "
+        f"id={outcome.row.id} version={outcome.row.version} "
+        f"verification_status={outcome.row.verification_status} "
+        f"available_at={outcome.row.available_at}"
+    )
+
+
 def _extraction_fields(
     source_document_id: str, page: int | None, quote: str | None,
     verify: bool, verified_by: str | None,
@@ -1676,13 +1832,27 @@ def _print_summary(summary: dict) -> None:
 async def _backtest_report(symbol: str | None, sector: str | None, model_version: str | None) -> None:
     from investing_agent.db.repositories.backtesting import BacktestScoreRepository
     from investing_agent.db.repositories.company import CompanyRepository
+    from investing_agent.db.repositories.financial import FinancialPeriodRepository
     from investing_agent.db.session import AsyncSessionLocal
     from investing_agent.schemas.backtesting import BacktestScoreRead
     from investing_agent.services.backtesting.report import group_and_summarize, summarize
 
     async with AsyncSessionLocal() as session:
         companies_by_id = {c.id: c for c in await CompanyRepository(session).list()}
-        rows = await BacktestScoreRepository(session).list_all()
+        periods_by_id = {p.id: p for p in await FinancialPeriodRepository(session).list()}
+        all_rows = await BacktestScoreRepository(session).list_all()
+
+        # A backtest rerun always inserts a new BacktestScore rather than
+        # overwriting (preserves full history across model_version changes —
+        # see BacktestScore's docstring). For reporting "current" accuracy,
+        # only the most recent score per (company, period, model_version)
+        # should count; list_all() is already ordered by created_at desc, so
+        # first-seen-wins per key gives the latest.
+        latest_by_key: dict[tuple, object] = {}
+        for r in all_rows:
+            key = (r.company_id, r.financial_period_id, r.model_version)
+            latest_by_key.setdefault(key, r)
+        rows = list(latest_by_key.values())
 
         if symbol:
             company = await _resolve_company(session, symbol)
@@ -1734,6 +1904,1083 @@ async def _backtest_report(symbol: str | None, sector: str | None, model_version
     by_model = group_and_summarize(scores, lambda s: s.model_version)
     for key, b in by_model.items():
         click.echo(f"  {key:24s} n={b['n']:<4d} pat_mape={b['pat_mape_pct']}%")
+
+    def _transition_label(s: "BacktestScoreRead") -> str:
+        period = periods_by_id.get(s.financial_period_id)
+        if period is None or not period.quarter:
+            return "unknown"
+        prior_quarter = {"Q1": "Q4", "Q2": "Q1", "Q3": "Q2", "Q4": "Q3"}.get(period.quarter, "?")
+        return f"{prior_quarter}->{period.quarter}"
+
+    click.echo("\nBy fiscal-quarter transition (descriptive only — no fitted coefficients):")
+    by_transition = group_and_summarize(scores, _transition_label)
+    for key in ("Q4->Q1", "Q1->Q2", "Q2->Q3", "Q3->Q4", "unknown"):
+        if key in by_transition:
+            b = by_transition[key]
+            click.echo(
+                f"  {key:10s} n={b['n']:<4d} rev_mape={b['revenue_mape_pct']}% "
+                f"pat_mape={b['pat_mape_pct']}% pat_within_band={b['pat_within_band_pct']}%"
+            )
+
+
+@cli.command("financial-seasonality")
+@click.option("--scope", default="STANDALONE", type=click.Choice(["STANDALONE", "CONSOLIDATED", "UNRESOLVED"]))
+@click.argument("symbol")
+def financial_seasonality_cmd(symbol: str, scope: str) -> None:
+    """Descriptive (non-fitted) margin/tax seasonality diagnostics for
+    SYMBOL: average PBT margin %, PAT margin %, and effective tax rate %
+    per fiscal quarter (Q1-Q4), computed directly from verified quarterly
+    FinancialResult rows. For analyst review ahead of any estimator
+    change -- never fits a coefficient, never feeds the estimator."""
+    asyncio.run(_financial_seasonality(symbol, scope))
+
+
+async def _financial_seasonality(symbol: str, scope: str) -> None:
+    from sqlalchemy import select
+
+    from investing_agent.db.models import FinancialPeriod, FinancialResult
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.diagnostics import QuarterlyFinancialPoint, compute_quarter_seasonality
+
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+
+        rows = await session.execute(
+            select(FinancialResult, FinancialPeriod)
+            .join(FinancialPeriod, FinancialResult.period_id == FinancialPeriod.id)
+            .where(
+                FinancialResult.company_id == company.id,
+                FinancialResult.statement_scope == scope,
+                FinancialResult.reporting_basis == "QUARTER",
+                FinancialResult.is_latest.is_(True),
+                FinancialResult.verification_status == "verified",
+            )
+        )
+
+        points: list[QuarterlyFinancialPoint] = []
+        for result, period in rows.all():
+            if period.quarter is None:
+                continue
+            tax_expense_raw = (result.other_metrics or {}).get("tax_expense")
+            points.append(
+                QuarterlyFinancialPoint(
+                    quarter=period.quarter,
+                    fiscal_year=period.fiscal_year,
+                    period_label=period.label,
+                    revenue=result.revenue,
+                    pbt=result.pbt,
+                    pat=result.pat,
+                    tax_expense=Decimal(tax_expense_raw) if tax_expense_raw is not None else None,
+                )
+            )
+
+    if not points:
+        click.echo(f"\nNo verified {scope} quarterly results found for {symbol}.")
+        return
+
+    by_quarter = compute_quarter_seasonality(points)
+    click.echo(f"\nMargin/tax seasonality — {symbol} ({scope}, n={len(points)} verified quarters)")
+    click.echo("Descriptive only — no fitted coefficients:\n")
+    for quarter in ("Q1", "Q2", "Q3", "Q4"):
+        if quarter in by_quarter:
+            b = by_quarter[quarter]
+            click.echo(
+                f"  {quarter}   n={b['n']:<3d} "
+                f"avg_pbt_margin={b['avg_pbt_margin_pct']}%  "
+                f"avg_pat_margin={b['avg_pat_margin_pct']}%  "
+                f"avg_effective_tax_rate={b['avg_effective_tax_rate_pct']}%"
+            )
+
+
+# ── Broker-account historical import (Phase 6A) ─────────────────────────────────
+
+@cli.command("record-broker-account")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option(
+    "--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]),
+)
+@click.option(
+    "--account-label", required=True,
+    help="Distinguishes multiple accounts at the same broker, e.g. 'primary'",
+)
+def record_broker_account_cmd(user_id: str | None, broker: str, account_label: str) -> None:
+    """Get-or-create a BrokerAccount. strategy_profile is fixed by broker
+    (ZERODHA -> LONG_TERM, INDMONEY -> MEDIUM_TERM), not user-configurable."""
+    asyncio.run(_record_broker_account(user_id, broker, account_label))
+
+
+async def _record_broker_account(user_id: str | None, broker: str, account_label: str) -> None:
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.schemas.broker_history import BrokerAccountCreate
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+
+    async with AsyncSessionLocal() as session:
+        repo = BrokerAccountRepository(session)
+        account, created = await repo.get_or_create(
+            BrokerAccountCreate(user_id=resolved_user_id, broker=broker, account_label=account_label)
+        )
+        await session.commit()
+
+    verb = "Created" if created else "Already exists"
+    click.echo(
+        f"\n{verb} — {broker} account '{account_label}' for user={resolved_user_id} "
+        f"id={account.id} strategy_profile={account.strategy_profile}"
+    )
+
+
+@cli.command("import-broker-statement")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False))
+def import_broker_statement_cmd(
+    user_id: str | None, broker: str, account_label: str, file_path: str
+) -> None:
+    """Import one exported statement FILE_PATH for a broker account.
+
+    Idempotent: re-running with the same file is a no-op; re-running with a
+    different file that overlaps in date range (e.g. Zerodha Console
+    tradebook exports, capped at 365 days per download) merges safely via
+    per-trade dedupe keys rather than duplicating.
+    """
+    asyncio.run(_import_broker_statement(user_id, broker, account_label, file_path))
+
+
+async def _import_broker_statement(
+    user_id: str | None, broker: str, account_label: str, file_path: str
+) -> None:
+    from pathlib import Path
+
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.ingestion.broker_history import get_importer
+    from investing_agent.services.ingestion.broker_history.import_service import (
+        import_statement_file,
+    )
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+
+    try:
+        importer = get_importer(broker)
+    except KeyError as exc:
+        click.echo(f"  ERROR: {exc}", err=True)
+        sys.exit(1)
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  ERROR: no BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label} — run record-broker-account first.",
+                err=True,
+            )
+            sys.exit(1)
+
+        try:
+            run = await import_statement_file(
+                session, broker_account_id=account.id, importer=importer, file_path=Path(file_path)
+            )
+            await session.commit()
+        except Exception as exc:
+            # import_statement_file already wrote a FAILED HistoricalImportRun
+            # row (for auditability, e.g. via broker-import-report) before
+            # re-raising -- commit to keep that record rather than discard it.
+            await session.commit()
+            click.echo(f"  ERROR: import failed — {exc}", err=True)
+            sys.exit(1)
+
+    click.echo(
+        f"\n{run.status} — {file_path}\n"
+        f"  run_id={run.id} source_type={run.source_type}\n"
+        f"  trades: +{run.trades_created} created, {run.trades_skipped_duplicate} already existed\n"
+        f"  cash_flows: +{run.cash_flows_created} created, {run.cash_flows_skipped_duplicate} already existed\n"
+        f"  dividends: +{run.dividends_created} created, {run.dividends_skipped_duplicate} already existed\n"
+        f"  date_range: {run.date_range_start} .. {run.date_range_end}"
+    )
+
+
+@cli.command("broker-import-report")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+def broker_import_report_cmd(user_id: str | None, broker: str, account_label: str) -> None:
+    """List every HistoricalImportRun for a broker account, most recent first."""
+    asyncio.run(_broker_import_report(user_id, broker, account_label))
+
+
+async def _broker_import_report(user_id: str | None, broker: str, account_label: str) -> None:
+    from sqlalchemy import select
+
+    from investing_agent.db.models import HistoricalImportRun
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  No BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label}."
+            )
+            return
+
+        result = await session.execute(
+            select(HistoricalImportRun)
+            .where(HistoricalImportRun.broker_account_id == account.id)
+            .order_by(HistoricalImportRun.created_at.desc())
+        )
+        runs = list(result.scalars().all())
+
+    if not runs:
+        click.echo(f"\nNo import runs yet for {broker} '{account_label}'.")
+        return
+
+    click.echo(f"\nImport runs — {broker} '{account_label}' ({len(runs)} total)")
+    for run in runs:
+        click.echo(
+            f"  [{run.status:7s}] {run.created_at.date()}  {run.file_name}  "
+            f"trades+{run.trades_created}/{run.trades_skipped_duplicate}dup  "
+            f"cash+{run.cash_flows_created}/{run.cash_flows_skipped_duplicate}dup  "
+            f"div+{run.dividends_created}/{run.dividends_skipped_duplicate}dup"
+            + (f"  ERROR: {run.error_message}" if run.error_message else "")
+        )
+
+
+# ── Portfolio reconstruction (Phase 6B) ─────────────────────────────────────
+
+@cli.command("reconstruct-portfolio")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+@click.option("--as-of", default=None, help="YYYY-MM-DD (defaults to today)")
+def reconstruct_portfolio_cmd(
+    user_id: str | None, broker: str, account_label: str, as_of: str | None
+) -> None:
+    """Replay trades+cash_flows to answer 'what did my portfolio look like
+    on date X'. Pure read -- does not write to historical_position_lots
+    (use rebuild-position-lots for that)."""
+    asyncio.run(_reconstruct_portfolio(user_id, broker, account_label, as_of))
+
+
+async def _reconstruct_portfolio(
+    user_id: str | None, broker: str, account_label: str, as_of: str | None
+) -> None:
+    from datetime import date as date_cls
+
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.reconstruction.service import get_portfolio_as_of
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+    as_of_date = date_cls.fromisoformat(as_of) if as_of else datetime.now(UTC).date()
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  ERROR: no BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label}.",
+                err=True,
+            )
+            sys.exit(1)
+
+        snapshot = await get_portfolio_as_of(
+            session, broker_account_id=account.id, as_of_date=as_of_date
+        )
+
+    click.echo(
+        f"\nPortfolio as of {snapshot.as_of_date} — {broker} '{account_label}' "
+        f"(strategy_profile={snapshot.strategy_profile})"
+    )
+    click.echo(
+        f"  cash_balance_partial={snapshot.cash_balance_partial}  "
+        f"[{snapshot.cash_balance_caveat}]"
+    )
+    click.echo(
+        f"  invested_capital_total={snapshot.invested_capital_total}  "
+        f"realized_pnl_cumulative_total={snapshot.realized_pnl_cumulative_total}  "
+        f"unrealized_pnl_total={snapshot.unrealized_pnl_total}"
+    )
+    click.echo(f"\n  positions ({len(snapshot.positions)}):")
+    for p in snapshot.positions:
+        flag = "  [CORPORATE ACTION SUSPECTED]" if p.corporate_action_flag else ""
+        click.echo(
+            f"    {p.symbol:15s} qty={p.quantity_held:>12}  avg_cost={p.average_cost:>10}  "
+            f"invested={p.invested_capital:>12}  realized_pnl={p.realized_pnl_cumulative:>12}{flag}"
+        )
+    if snapshot.corporate_action_adjustments:
+        click.echo(f"\n  corporate_action_adjustments ({len(snapshot.corporate_action_adjustments)}):")
+        for a in snapshot.corporate_action_adjustments:
+            click.echo(
+                f"    {a.symbol} {a.event_type} {a.event_date}: "
+                f"{a.old_quantity}@{a.old_cost_per_share} -> {a.new_quantity}@{a.adjusted_cost_per_share} "
+                f"(ratio={a.ratio_old}:{a.ratio_new}, source={a.source})"
+            )
+    if snapshot.warnings:
+        click.echo(f"\n  warnings ({len(snapshot.warnings)}):")
+        for w in snapshot.warnings:
+            click.echo(f"    - {w}")
+
+
+@cli.command("rebuild-position-lots")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+def rebuild_position_lots_cmd(user_id: str | None, broker: str, account_label: str) -> None:
+    """Full-history FIFO replay, wholesale-replacing historical_position_lots
+    for this account (see HistoricalPositionLot's own docstring)."""
+    asyncio.run(_rebuild_position_lots(user_id, broker, account_label))
+
+
+async def _rebuild_position_lots(user_id: str | None, broker: str, account_label: str) -> None:
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.reconstruction.service import reconstruct_and_persist
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  ERROR: no BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label}.",
+                err=True,
+            )
+            sys.exit(1)
+
+        result = await reconstruct_and_persist(session, broker_account_id=account.id)
+        await session.commit()
+
+    click.echo(
+        f"\nRebuilt position lots — {broker} '{account_label}' as of {result.as_of_date}\n"
+        f"  lots_written={result.lots_written}  "
+        f"symbols_with_open_positions={result.symbols_with_open_positions}  "
+        f"warnings={len(result.warnings)}"
+    )
+
+
+@cli.command("reconcile-portfolio")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+@click.option(
+    "--statements-dir", required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Directory containing pnl-*.xlsx / holdings-*.xlsx exports",
+)
+def reconcile_portfolio_cmd(
+    user_id: str | None, broker: str, account_label: str, statements_dir: str
+) -> None:
+    """Cross-check the FIFO reconstruction against Zerodha's own P&L /
+    holdings exports. Exits non-zero if overall_status is DIVERGENT."""
+    asyncio.run(_reconcile_portfolio(user_id, broker, account_label, statements_dir))
+
+
+async def _reconcile_portfolio(
+    user_id: str | None, broker: str, account_label: str, statements_dir: str
+) -> None:
+    from pathlib import Path
+
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.reconstruction.reconciliation import reconcile_account
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  ERROR: no BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label}.",
+                err=True,
+            )
+            sys.exit(1)
+
+        statement_files = sorted(Path(statements_dir).glob("pnl-*.xlsx")) + sorted(
+            Path(statements_dir).glob("holdings-*.xlsx")
+        )
+        report = await reconcile_account(
+            session, broker_account_id=account.id, statement_files=statement_files
+        )
+
+    click.echo(
+        f"\nReconciliation — {broker} '{account_label}' [{report.overall_status}]\n"
+        f"  total_symbols_checked={report.total_symbols_checked}"
+    )
+    q = report.quality_score
+    click.echo(
+        f"  quality_score: holdings_qty={q.holdings_quantity_match_pct}%  "
+        f"holdings_avg_cost={q.holdings_avg_cost_match_pct}%  "
+        f"realized_pnl={q.realized_pnl_match_pct}%  "
+        f"unresolved_symbols={q.unresolved_symbol_count}"
+    )
+    if report.expected_gaps_corporate_action:
+        click.echo(
+            f"  expected_gaps_corporate_action ({len(report.expected_gaps_corporate_action)}): "
+            f"{', '.join(report.expected_gaps_corporate_action)}"
+        )
+    if report.divergent_symbols:
+        click.echo(f"  divergent_symbols ({len(report.divergent_symbols)}): {', '.join(report.divergent_symbols)}")
+        for d in report.row_diffs:
+            click.echo(
+                f"    [{d.statement_file}] {d.symbol} {d.field}: expected={d.expected} "
+                f"actual={d.actual} delta={d.delta} ({d.likely_cause})"
+            )
+    if report.warnings:
+        click.echo(f"  warnings: {report.warnings}")
+
+    if report.overall_status == "DIVERGENT":
+        sys.exit(1)
+
+
+@cli.command("record-corporate-action")
+@click.argument("symbol")
+@click.option("--event-type", required=True, type=click.Choice(["SPLIT", "BONUS"]))
+@click.option("--event-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--ratio-old", required=True, type=float, help="e.g. 1 in a 1:10 split")
+@click.option("--ratio-new", required=True, type=float, help="e.g. 10 in a 1:10 split")
+@click.option("--source", required=True, help="Provenance note, e.g. an NSE circular URL or description")
+@click.option("--source-url", default=None)
+@click.option("--notes", default=None)
+def record_corporate_action_cmd(
+    symbol: str,
+    event_type: str,
+    event_date: datetime,
+    ratio_old: float,
+    ratio_new: float,
+    source: str,
+    source_url: str | None,
+    notes: str | None,
+) -> None:
+    """Record a stock split/bonus so FIFO reconstruction applies it to open
+    lots at event_date (see services/reconstruction/fifo.py). Backed by the
+    existing corporate_actions table (action_type split|bonus), not a new
+    one -- upsert-versioned, so re-running with the same symbol/date/type
+    is idempotent."""
+    asyncio.run(
+        _record_corporate_action(
+            symbol, event_type, event_date.date(), ratio_old, ratio_new, source, source_url, notes
+        )
+    )
+
+
+async def _record_corporate_action(
+    symbol: str,
+    event_type: str,
+    event_date,
+    ratio_old: float,
+    ratio_new: float,
+    source: str,
+    source_url: str | None,
+    notes: str | None,
+) -> None:
+    from decimal import Decimal
+
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.reconstruction.corporate_actions import (
+        record_corporate_action_event,
+    )
+
+    async with AsyncSessionLocal() as session:
+        row, created = await record_corporate_action_event(
+            session,
+            symbol=symbol,
+            event_type=event_type,  # type: ignore[arg-type]
+            event_date=event_date,
+            ratio_new=Decimal(str(ratio_new)),
+            ratio_old=Decimal(str(ratio_old)),
+            source=source,
+            source_url=source_url,
+            notes=notes,
+        )
+        await session.commit()
+
+    verb = "Recorded" if created else "Already up to date:"
+    click.echo(
+        f"{verb} {symbol} {event_type} ratio={ratio_old}:{ratio_new} on {event_date} "
+        f"(id={row.id}, version={row.version})"
+    )
+
+
+@cli.command("record-opening-position-adjustment")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+@click.argument("symbol")
+@click.option("--opening-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--quantity", required=True, type=float)
+@click.option("--cost-price", required=True, type=float)
+@click.option("--source", required=True, help='e.g. "ZERODHA_PNL_RECONCILIATION"')
+@click.option("--confidence", required=True, type=click.Choice(["LOW", "MEDIUM", "HIGH"]))
+@click.option("--reason", required=True, help='e.g. "MISSING_TRADE_HISTORY"')
+@click.option("--notes", default=None)
+def record_opening_position_adjustment_cmd(
+    user_id: str | None,
+    broker: str,
+    account_label: str,
+    symbol: str,
+    opening_date: datetime,
+    quantity: float,
+    cost_price: float,
+    source: str,
+    confidence: str,
+    reason: str,
+    notes: str | None,
+) -> None:
+    """Record a reconciliation-derived synthetic opening lot for a symbol
+    whose real acquisition trade is missing from the tradebook (e.g. a
+    SELL with no prior BUY) -- resolves the oversell at its source instead
+    of leaving a zero-cost synthetic lot. Never fabricated silently:
+    source/confidence/reason are mandatory and always surfaced in
+    reconstruction warnings."""
+    asyncio.run(
+        _record_opening_position_adjustment(
+            user_id, broker, account_label, symbol, opening_date.date(),
+            quantity, cost_price, source, confidence, reason, notes,
+        )
+    )
+
+
+async def _record_opening_position_adjustment(
+    user_id: str | None,
+    broker: str,
+    account_label: str,
+    symbol: str,
+    opening_date,
+    quantity: float,
+    cost_price: float,
+    source: str,
+    confidence: str,
+    reason: str,
+    notes: str | None,
+) -> None:
+    from decimal import Decimal
+
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.reconstruction.corporate_actions import (
+        record_opening_position_adjustment,
+    )
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  ERROR: no BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label}.",
+                err=True,
+            )
+            sys.exit(1)
+
+        row, created = await record_opening_position_adjustment(
+            session,
+            broker_account_id=account.id,
+            symbol=symbol,
+            opening_date=opening_date,
+            quantity=Decimal(str(quantity)),
+            cost_price=Decimal(str(cost_price)),
+            source=source,
+            confidence=confidence,  # type: ignore[arg-type]
+            reason=reason,
+            notes=notes,
+        )
+        await session.commit()
+
+    verb = "Recorded" if created else "Updated"
+    click.echo(
+        f"{verb} opening-position adjustment: {symbol} qty={quantity} cost_price={cost_price} "
+        f"on {opening_date} (id={row.id}, confidence={confidence}, reason={reason})"
+    )
+
+
+# ── Historical market prices (Phase 6C.0) ───────────────────────────────────
+
+@cli.command("sync-daily-prices")
+@click.argument("symbol")
+@click.option("--start-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--end-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+def sync_daily_prices_cmd(symbol: str, start_date: datetime, end_date: datetime) -> None:
+    """Fetch + archive + persist raw (unadjusted) NSE bhavcopy daily OHLCV
+    for SYMBOL over [--start-date, --end-date]. Idempotent: re-running is a
+    no-op for dates already synced."""
+    asyncio.run(_sync_daily_prices(symbol, start_date.date(), end_date.date()))
+
+
+async def _sync_daily_prices(symbol: str, start_date, end_date) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.prices.ingestion import sync_daily_prices
+    from investing_agent.services.prices.nse_bhavcopy import NSEBhavcopyHistoricalPriceProvider
+
+    provider = NSEBhavcopyHistoricalPriceProvider()
+    try:
+        async with AsyncSessionLocal() as session:
+            summary = await sync_daily_prices(session, symbol, start_date, end_date, provider)
+            await session.commit()
+    finally:
+        await provider.aclose()
+
+    click.echo(
+        f"\nsync-daily-prices {symbol} {start_date} .. {end_date}\n"
+        f"  dates_checked={summary.dates_checked} dates_no_data={summary.dates_no_data}\n"
+        f"  rows: +{summary.rows_created} created, {summary.rows_skipped_duplicate} already existed"
+    )
+    if summary.errors:
+        click.echo(f"  errors ({len(summary.errors)}):")
+        for err in summary.errors:
+            click.echo(f"    {err}")
+
+
+@cli.command("sync-benchmark-prices")
+@click.option("--benchmark-code", required=True, type=click.Choice(["NIFTY_50"]))
+@click.option("--start-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--end-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+def sync_benchmark_prices_cmd(
+    benchmark_code: str, start_date: datetime, end_date: datetime
+) -> None:
+    """Fetch + archive + persist raw NSE Indices daily OHLC for
+    --benchmark-code over [--start-date, --end-date]. Idempotent."""
+    asyncio.run(_sync_benchmark_prices(benchmark_code, start_date.date(), end_date.date()))
+
+
+async def _sync_benchmark_prices(benchmark_code: str, start_date, end_date) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.prices.ingestion import sync_benchmark_prices
+    from investing_agent.services.prices.nse_indices import NSEIndicesBenchmarkPriceProvider
+
+    provider = NSEIndicesBenchmarkPriceProvider(benchmark_code)
+    try:
+        async with AsyncSessionLocal() as session:
+            summary = await sync_benchmark_prices(
+                session, benchmark_code, start_date, end_date, provider
+            )
+            await session.commit()
+    finally:
+        await provider.aclose()
+
+    click.echo(
+        f"\nsync-benchmark-prices {benchmark_code} {start_date} .. {end_date}\n"
+        f"  dates_checked={summary.dates_checked} dates_no_data={summary.dates_no_data}\n"
+        f"  rows: +{summary.rows_created} created, {summary.rows_skipped_duplicate} already existed"
+    )
+    if summary.errors:
+        click.echo(f"  errors ({len(summary.errors)}):")
+        for err in summary.errors:
+            click.echo(f"    {err}")
+
+
+@cli.command("show-daily-prices")
+@click.argument("symbol")
+@click.option("--start-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--end-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+def show_daily_prices_cmd(symbol: str, start_date: datetime, end_date: datetime) -> None:
+    """List persisted daily_prices rows for SYMBOL in a date range (for
+    manual verification against the source file)."""
+    asyncio.run(_show_daily_prices(symbol, start_date.date(), end_date.date()))
+
+
+async def _show_daily_prices(symbol: str, start_date, end_date) -> None:
+    from investing_agent.db.repositories.prices import DailyPriceRepository
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        rows = await DailyPriceRepository(session).list_between(symbol.upper(), start_date, end_date)
+
+    if not rows:
+        click.echo(f"\nNo daily_prices rows for {symbol} between {start_date} and {end_date}.")
+        return
+
+    click.echo(f"\n{symbol} daily prices ({len(rows)} rows)")
+    for row in rows:
+        click.echo(
+            f"  {row.trading_date}  O={row.open} H={row.high} L={row.low} C={row.close} "
+            f"V={row.volume}  [{row.adjustment_status}]"
+        )
+
+
+@cli.command("walk-forward-run")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+@click.option(
+    "--position",
+    "positions",
+    required=True,
+    multiple=True,
+    help="SYMBOL:YYYY-MM-DD, repeatable — one walk-forward decision date per symbol",
+)
+@click.option(
+    "--horizons", default="1,3,6,12", help="Comma-separated month horizons (default: 1,3,6,12)"
+)
+@click.option("--model-version", default="walkforward-v1")
+def walk_forward_run_cmd(
+    user_id: str | None,
+    broker: str,
+    account_label: str,
+    positions: tuple[str, ...],
+    horizons: str,
+    model_version: str,
+) -> None:
+    """Freeze ACTUAL + HOLD_BASELINE decisions for each SYMBOL:DATE pair as
+    of that decision date, then score both against future prices.
+
+    Point-in-time by construction: decision freezing (services/walkforward/
+    decisions.py) never imports a price repository at all, so no future
+    price can influence the frozen decision — only the separate outcome-
+    scoring step (services/walkforward/outcomes.py), which runs strictly
+    after, ever sees prices with trading_date beyond the decision date.
+    """
+    asyncio.run(_walk_forward_run(user_id, broker, account_label, positions, horizons, model_version))
+
+
+async def _walk_forward_run(
+    user_id: str | None,
+    broker: str,
+    account_label: str,
+    positions: tuple[str, ...],
+    horizons: str,
+    model_version: str,
+) -> None:
+    from datetime import date as date_cls
+
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.walkforward.runner import run_walk_forward
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+
+    symbol_dates: list[tuple[str, date_cls]] = []
+    for raw in positions:
+        symbol, _, date_str = raw.partition(":")
+        if not symbol or not date_str:
+            click.echo(f"  ERROR: invalid --position {raw!r}, expected SYMBOL:YYYY-MM-DD", err=True)
+            sys.exit(1)
+        symbol_dates.append((symbol.upper(), date_cls.fromisoformat(date_str)))
+    horizons_months = tuple(int(h.strip()) for h in horizons.split(","))
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  ERROR: no BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label}.",
+                err=True,
+            )
+            sys.exit(1)
+
+        try:
+            result = await run_walk_forward(
+                session,
+                broker_account_id=account.id,
+                symbol_dates=symbol_dates,
+                horizons_months=horizons_months,
+                model_version=model_version,
+            )
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    click.echo(f"\nWalk-forward run {result.run.id} — {len(result.entries)} decisions frozen+scored")
+    for entry in result.entries:
+        d, o = entry.decision, entry.outcome
+        click.echo(
+            f"  {d.symbol:12s} {d.decision_at} [{d.decision_source:13s}] action={d.action:6s} "
+            f"qty={d.quantity_held}  data_quality={d.data_quality_status}  "
+            f"outcome={o.outcome_status}"
+        )
+
+
+@cli.command("walk-forward-show")
+@click.option("--run-id", required=True, help="WalkForwardRun UUID")
+def walk_forward_show_cmd(run_id: str) -> None:
+    """Full report for one walk-forward run: portfolio state at T, actual
+    action, HOLD baseline, agent action if available, stock/NIFTY 1M/3M/6M/
+    12M returns, excess return, and data-quality status for every decision."""
+    asyncio.run(_walk_forward_show(run_id))
+
+
+async def _walk_forward_show(run_id: str) -> None:
+    import uuid as uuid_module
+
+    from investing_agent.db.repositories.walkforward import (
+        WalkForwardDecisionRepository,
+        WalkForwardOutcomeRepository,
+        WalkForwardRunRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        run = await WalkForwardRunRepository(session).get(uuid_module.UUID(run_id))
+        if run is None:
+            click.echo(f"  ERROR: no WalkForwardRun with id={run_id}", err=True)
+            sys.exit(1)
+
+        decisions = await WalkForwardDecisionRepository(session).list_for_run(run.id)
+        outcome_repo = WalkForwardOutcomeRepository(session)
+        by_symbol_date: dict[tuple[str, object], dict[str, object]] = {}
+        for d in decisions:
+            key = (d.symbol, d.decision_at)
+            outcome = await outcome_repo.get_by_decision_id(d.id)
+            by_symbol_date.setdefault(key, {})[d.decision_source] = (d, outcome)
+
+    click.echo(
+        f"\nWalk-forward run {run.id} — broker_account={run.broker_account_id} "
+        f"strategy={run.strategy_profile}  horizons={run.horizons_months}  model={run.model_version}"
+    )
+
+    for (symbol, decision_at), by_source in sorted(by_symbol_date.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        click.echo(f"\n{symbol}  decision_at={decision_at}")
+        actual = by_source.get("ACTUAL")
+        hold = by_source.get("HOLD_BASELINE")
+        agent = by_source.get("AGENT")
+
+        if actual:
+            d, _o = actual
+            click.echo(
+                f"  portfolio state at T : qty={d.quantity_held}  avg_cost={d.average_cost}  "
+                f"invested={d.invested_capital}"
+            )
+        for label, entry in (("ACTUAL", actual), ("HOLD_BASELINE", hold), ("AGENT", agent)):
+            if entry is None:
+                if label == "AGENT":
+                    click.echo("  AGENT           : not available (no deterministic recommendation generator in v1)")
+                continue
+            d, o = entry
+            click.echo(f"  {label:15s}: action={d.action:6s}  data_quality={d.data_quality_status}")
+            if o is not None:
+                click.echo(
+                    f"    entry_price={o.entry_price} ({o.entry_price_date})  outcome_status={o.outcome_status}"
+                )
+                for h in ("1m", "3m", "6m", "12m"):
+                    stock_r = getattr(o, f"stock_return_{h}")
+                    bench_r = getattr(o, f"benchmark_return_{h}")
+                    excess_r = getattr(o, f"excess_return_{h}")
+                    click.echo(
+                        f"    {h.upper():>4s}: stock={stock_r}  nifty={bench_r}  excess={excess_r}"
+                    )
+                if o.data_quality_notes:
+                    for note in o.data_quality_notes:
+                        click.echo(f"    note: {note}")
+
+
+@cli.command("walk-forward-bulk-run")
+@click.option("--user-id", default=None, help="User ID (defaults to DEFAULT_USER_ID from .env)")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA", "INDMONEY"]))
+@click.option("--account-label", required=True)
+@click.option(
+    "--horizons", default="1,3,6,12", help="Comma-separated month horizons (default: 1,3,6,12)"
+)
+@click.option("--model-version", default="walkforward-v1")
+def walk_forward_bulk_run_cmd(
+    user_id: str | None, broker: str, account_label: str, horizons: str, model_version: str
+) -> None:
+    """Phase 6D: generate a walk-forward decision point for every real
+    (symbol, trade_date) pair in this account's tradebook (BUY/ADD/REDUCE/
+    EXIT, whatever genuinely happened), then freeze + score ACTUAL and
+    HOLD_BASELINE for all of them via the unmodified Phase 6C pipeline --
+    same PIT guarantees, no new decision logic. Run walk-forward-report
+    afterward for the aggregate diagnostics."""
+    asyncio.run(_walk_forward_bulk_run(user_id, broker, account_label, horizons, model_version))
+
+
+async def _walk_forward_bulk_run(
+    user_id: str | None, broker: str, account_label: str, horizons: str, model_version: str
+) -> None:
+    from investing_agent.db.repositories.broker_history import BrokerAccountRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.walkforward.runner import run_bulk_walk_forward
+
+    settings = get_settings()
+    resolved_user_id = user_id or settings.default_user_id
+    horizons_months = tuple(int(h.strip()) for h in horizons.split(","))
+
+    async with AsyncSessionLocal() as session:
+        account_repo = BrokerAccountRepository(session)
+        account = await account_repo.get_by_label(resolved_user_id, broker, account_label)
+        if account is None:
+            click.echo(
+                f"  ERROR: no BrokerAccount for user={resolved_user_id} broker={broker} "
+                f"account_label={account_label}.",
+                err=True,
+            )
+            sys.exit(1)
+
+        try:
+            result = await run_bulk_walk_forward(
+                session,
+                broker_account_id=account.id,
+                horizons_months=horizons_months,
+                model_version=model_version,
+            )
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            click.echo(f"  ERROR: {exc}", err=True)
+            sys.exit(1)
+
+    n_points = len(result.entries) // 2  # ACTUAL + HOLD_BASELINE per decision point
+    click.echo(
+        f"\nBulk walk-forward run {result.run.id} — {n_points} decision points "
+        f"({len(result.entries)} decisions frozen+scored)"
+    )
+    action_counts: dict[str, int] = {}
+    for entry in result.entries:
+        if entry.decision.decision_source != "ACTUAL":
+            continue
+        action_counts[entry.decision.action] = action_counts.get(entry.decision.action, 0) + 1
+    click.echo("  Actions: " + ", ".join(f"{k}={v}" for k, v in sorted(action_counts.items())))
+    click.echo(f"  Run walk-forward-report --run-id {result.run.id} for the aggregate report.")
+
+
+@cli.command("walk-forward-report")
+@click.option("--run-id", required=True, help="WalkForwardRun UUID")
+@click.option(
+    "--csv-out", default=None, type=click.Path(dir_okay=False),
+    help="Write the full event-level audit table to this CSV path (trade -> decision -> outcome traceability)",
+)
+def walk_forward_report_cmd(run_id: str, csv_out: str | None) -> None:
+    """Aggregate diagnostics for a walk-forward run: scored/unscorable
+    counts, median/mean stock and excess returns, positive-return and
+    benchmark-outperformance rates, actual-vs-HOLD delta, and max-drawdown
+    distribution -- broken down by action, horizon, calendar year,
+    holding-age bucket, and position-concentration bucket. Every aggregate
+    number traces back to an individual decision via --csv-out."""
+    asyncio.run(_walk_forward_report(run_id, csv_out))
+
+
+async def _walk_forward_report(run_id: str, csv_out: str | None) -> None:
+    import csv as csv_module
+    import uuid as uuid_module
+
+    from investing_agent.db.repositories.walkforward import (
+        WalkForwardDecisionRepository,
+        WalkForwardOutcomeRepository,
+        WalkForwardRunRepository,
+    )
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.walkforward.aggregation import build_report
+    from investing_agent.services.walkforward.audit import build_audit_rows
+    from investing_agent.services.walkforward.runner import WalkForwardEntry
+
+    async with AsyncSessionLocal() as session:
+        run = await WalkForwardRunRepository(session).get(uuid_module.UUID(run_id))
+        if run is None:
+            click.echo(f"  ERROR: no WalkForwardRun with id={run_id}", err=True)
+            sys.exit(1)
+
+        decisions = await WalkForwardDecisionRepository(session).list_for_run(run.id)
+        outcome_repo = WalkForwardOutcomeRepository(session)
+        entries: list[WalkForwardEntry] = []
+        for d in decisions:
+            o = await outcome_repo.get_by_decision_id(d.id)
+            if o is None:
+                continue
+            entries.append(WalkForwardEntry(decision=d, outcome=o))
+
+        rows = await build_audit_rows(session, broker_account_id=run.broker_account_id, entries=entries)
+
+    if not rows:
+        click.echo("\nNo decisions found for this run.")
+        return
+
+    report = build_report(rows)
+    click.echo(
+        f"\nWalk-forward report — run {run.id}  events={report['n_events_total']}  "
+        f"included={report['n_events_included']}"
+    )
+    click.echo("\nData quality:")
+    for k, v in sorted(report["data_quality_counts"].items()):
+        click.echo(f"  {k}: {v}")
+
+    dd = report["drawdown_distribution"]
+    click.echo(
+        f"\nMax drawdown (n={dd['n']}): median={dd['median_pct']}%  mean={dd['mean_pct']}%  "
+        f"worst={dd['worst_pct']}%  best={dd['best_pct']}%"
+    )
+
+    def _print_bucket_group(title: str, groups: dict[str, dict]) -> None:
+        click.echo(f"  {title}:")
+        for key, b in sorted(groups.items()):
+            click.echo(
+                f"    {key:10s} n={b['n_scored_this_horizon']:<4d} "
+                f"median_stock={b['median_stock_return_pct']}%  median_excess={b['median_excess_return_pct']}%  "
+                f"outperform_rate={b['benchmark_outperform_rate_pct']}%"
+            )
+
+    for horizon in ("1m", "3m", "6m", "12m"):
+        h = report["by_horizon"][horizon]
+        click.echo(f"\n== {horizon.upper()} ==")
+        o = h["overall"]
+        click.echo(
+            f"  overall n_included={o['n_included']} n_scored={o['n_scored_this_horizon']} "
+            f"median_stock={o['median_stock_return_pct']}%  mean_stock={o['mean_stock_return_pct']}%  "
+            f"median_excess={o['median_excess_return_pct']}%  mean_excess={o['mean_excess_return_pct']}%  "
+            f"positive_rate={o['positive_return_rate_pct']}%  outperform_rate={o['benchmark_outperform_rate_pct']}%\n"
+            f"  decision $ impact (actual vs HOLD, INR): median={o['decision_dollar_impact_median']}  "
+            f"mean={o['decision_dollar_impact_mean']}  positive_rate={o['decision_dollar_impact_positive_rate_pct']}% "
+            f"(n={o['decision_dollar_impact_n']})"
+        )
+        _print_bucket_group("by action", h["by_action"])
+        _print_bucket_group("by year", h["by_year"])
+        _print_bucket_group("by holding age", h["by_holding_age"])
+        _print_bucket_group("by concentration", h["by_concentration"])
+
+    if csv_out:
+        with open(csv_out, "w", newline="") as f:
+            writer = csv_module.writer(f)
+            header = [
+                "symbol", "decision_at", "decision_id", "hold_decision_id", "action",
+                "data_quality_status", "outcome_status", "quantity_held", "invested_capital",
+                "holding_age_days", "concentration_pct", "calendar_year", "entry_price",
+            ]
+            for h_label in ("1m", "3m", "6m", "12m"):
+                header += [
+                    f"stock_return_{h_label}", f"benchmark_return_{h_label}",
+                    f"excess_return_{h_label}", f"hold_stock_return_{h_label}",
+                ]
+            header += ["max_drawdown_pct", "included_in_aggregate", "exclusion_reason", "data_quality_notes"]
+            writer.writerow(header)
+            for r in rows:
+                row = [
+                    r.symbol, r.decision_at, r.decision_id, r.hold_decision_id, r.action,
+                    r.data_quality_status, r.outcome_status, r.quantity_held, r.invested_capital,
+                    r.holding_age_days, r.concentration_pct, r.calendar_year, r.entry_price,
+                ]
+                for h_label in ("1m", "3m", "6m", "12m"):
+                    row += [
+                        r.stock_return[h_label], r.benchmark_return[h_label],
+                        r.excess_return[h_label], r.hold_stock_return[h_label],
+                    ]
+                row += [
+                    r.max_drawdown_pct, r.included_in_aggregate, r.exclusion_reason,
+                    "; ".join(r.data_quality_notes),
+                ]
+                writer.writerow(row)
+        click.echo(f"\nEvent-level audit table written to {csv_out} ({len(rows)} rows)")
 
 
 def main() -> None:

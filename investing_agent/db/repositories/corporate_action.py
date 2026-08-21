@@ -186,3 +186,43 @@ class CorporateActionRepository(BaseRepository[CorporateAction]):
             stmt.order_by(CorporateAction.expected_result_date.asc())
         )
         return list(result.scalars().all())
+
+    async def list_all_splits_and_bonuses(self) -> list[CorporateAction]:
+        """Every latest-version split/bonus row across all companies,
+        ordered by event_date -- used by Phase 6B's FIFO reconstruction
+        (services/reconstruction/corporate_actions.py) to apply ratio
+        adjustments to a broker account's open lots. Global, not
+        company-scoped, since reconstruction keys off HistoricalTrade.symbol
+        (company_id there is frequently unresolved)."""
+        result = await self.session.execute(
+            select(CorporateAction)
+            .where(
+                CorporateAction.action_type.in_(("split", "bonus")),
+                CorporateAction.is_latest.is_(True),
+            )
+            .order_by(CorporateAction.event_date.asc())
+        )
+        return list(result.scalars().all())
+
+    async def list_all_splits_and_bonuses_as_of(self, as_of: datetime) -> list[CorporateAction]:
+        """Point-in-time variant of list_all_splits_and_bonuses: highest
+        version per (symbol, action_type, event_date, source_type) whose
+        available_at <= as_of, across all companies. Used by Phase 6C's
+        walk-forward decision-freeze so a corrected/backfilled split/bonus
+        record can never leak into a reconstruction frozen at an earlier
+        decision date (mirrors list_by_company_as_of's dedup logic, without
+        the company_id filter)."""
+        result = await self.session.execute(
+            select(CorporateAction).where(
+                CorporateAction.action_type.in_(("split", "bonus")),
+                CorporateAction.available_at <= as_of,
+            )
+        )
+        rows = list(result.scalars().all())
+        latest_per_group: dict[tuple, CorporateAction] = {}
+        for row in rows:
+            key = (row.symbol, row.action_type, row.event_date, row.source_type)
+            current = latest_per_group.get(key)
+            if current is None or row.version > current.version:
+                latest_per_group[key] = row
+        return sorted(latest_per_group.values(), key=lambda r: r.event_date)
