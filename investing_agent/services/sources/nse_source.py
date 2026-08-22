@@ -45,6 +45,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -145,7 +146,7 @@ class NSEDataSource(CorporateActionSource, FinancialResultSource, FilingSource):
     async def get_corporate_actions(
         self, symbol: str
     ) -> tuple[list[RawCorporateAction], DiscoveredDocument | None]:
-        url = f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol={symbol}"
+        url = f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol={quote(symbol, safe='')}"
         status, body = await self._get(url)
         now = datetime.now(UTC)
         if status != 200 or not body:
@@ -203,7 +204,7 @@ class NSEDataSource(CorporateActionSource, FinancialResultSource, FilingSource):
     async def get_quarterly_results(
         self, symbol: str
     ) -> tuple[list[RawFinancialResult], DiscoveredDocument | None]:
-        url = f"https://www.nseindia.com/api/results-comparision?index=equities&symbol={symbol}"
+        url = f"https://www.nseindia.com/api/results-comparision?index=equities&symbol={quote(symbol, safe='')}"
         status, body = await self._get(url)
         now = datetime.now(UTC)
         if status != 200 or not body:
@@ -258,7 +259,7 @@ class NSEDataSource(CorporateActionSource, FinancialResultSource, FilingSource):
         """Raises SourceAccessError (403/blocked) or SourceTransientError
         (retries exhausted) — the caller (FilingIngestionService) decides
         how to degrade; this method never swallows those two."""
-        url = _ANNOUNCEMENTS_URL.format(symbol=symbol)
+        url = _ANNOUNCEMENTS_URL.format(symbol=quote(symbol, safe=""))
         status, body, _ = await self._get_resilient(url)
         if status != 200 or not body:
             log.warning("nse_source.announcements_empty", symbol=symbol, status=status)

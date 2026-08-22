@@ -24,6 +24,10 @@ class InvestmentThesisCreate(BaseSchema):
     target_price_high: Decimal | None = None
     horizon_months: int | None = Field(None, ge=1, le=360)
     entry_price: Decimal | None = None
+    company_id: uuid.UUID | None = None
+    as_of: datetime | None = None
+    thesis_model_version: str = "active-thesis-v1"
+    evidence_refs: list[dict] | None = None
 
 
 class InvestmentThesisUpdate(BaseSchema):
@@ -39,6 +43,9 @@ class InvestmentThesisUpdate(BaseSchema):
     horizon_months: int | None = Field(None, ge=1, le=360)
     exit_price: Decimal | None = None
     outcome_notes: str | None = None
+    as_of: datetime | None = None
+    thesis_model_version: str | None = None
+    evidence_refs: list[dict] | None = None
 
 
 class InvestmentThesisRead(TimestampedSchema):
@@ -59,3 +66,8 @@ class InvestmentThesisRead(TimestampedSchema):
     entry_price: Decimal | None
     exit_price: Decimal | None
     outcome_notes: str | None
+    thesis_version: int
+    thesis_model_version: str
+    as_of: datetime | None
+    evidence_refs: list[dict] | None
+    supersedes_thesis_id: uuid.UUID | None

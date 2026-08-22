@@ -87,6 +87,17 @@ class TestParseAnnouncementDatetime:
 
 class TestGetAnnouncements:
     @pytest.mark.asyncio
+    async def test_symbol_is_url_encoded(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.params["symbol"] == "M&M"
+            assert "M%26M" in str(request.url)
+            return httpx.Response(200, content=b"[]")
+
+        source = NSEDataSource(client=_client_for(handler))
+        assert await source.get_announcements("M&M") == []
+        await source.aclose()
+
+    @pytest.mark.asyncio
     async def test_bel_announcement_discovery(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, content=json.dumps(BEL_ANNOUNCEMENTS).encode())

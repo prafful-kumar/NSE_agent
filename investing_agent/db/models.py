@@ -14,6 +14,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -293,7 +294,11 @@ class UserPreference(TimestampMixin, Base):
 # ── Investment theses ─────────────────────────────────────────────────────────
 
 class InvestmentThesis(TimestampMixin, Base):
-    """Active or historical investment thesis for a stock."""
+    """Append-only, point-in-time investment-thesis version.
+
+    A later view of a thesis creates a new row linked through
+    ``supersedes_thesis_id``; historical rows are never changed in place.
+    """
 
     __tablename__ = "investment_theses"
 
@@ -320,6 +325,15 @@ class InvestmentThesis(TimestampMixin, Base):
     entry_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     exit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     outcome_notes: Mapped[str | None] = mapped_column(Text)
+    thesis_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    thesis_model_version: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="active-thesis-v1"
+    )
+    as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    evidence_refs: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    supersedes_thesis_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("investment_theses.id"), index=True
+    )
     # Vector embedding of the thesis text (for semantic retrieval)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536))
 
@@ -809,6 +823,33 @@ class RecommendationEvidenceLink(Base):
     evidence_type: Mapped[str] = mapped_column(String(50), nullable=False)
     evidence_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
+class RecommendationReview(Base):
+    """Immutable human review observation for a frozen recommendation.
+
+    Reviews deliberately have no relation to rule selection, confidence,
+    valuation, thesis, or policy activation.  They record what a reviewer
+    thought at a point in time; later phases may analyse them separately.
+    """
+
+    __tablename__ = "recommendation_reviews"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    recommendation_decision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("recommendation_decisions.id", ondelete="RESTRICT"),
+        index=True,
+        nullable=False,
+    )
+    # AGREE | DISAGREE | UNSURE.  Database constraint mirrors the CLI choice.
+    verdict: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("verdict IN ('AGREE', 'DISAGREE', 'UNSURE')", name="ck_recommendation_review_verdict"),
+    )
 
 
 # ── Instrument master ─────────────────────────────────────────────────────────

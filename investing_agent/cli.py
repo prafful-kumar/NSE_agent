@@ -3424,6 +3424,41 @@ async def _valuation_run(symbols: list[str], as_of: datetime) -> None:
         await session.commit()
 
 
+@cli.command("active-thesis-create")
+@click.argument("symbol")
+@click.option("--as-of", required=True, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
+@click.option("--thesis", required=True)
+@click.option("--driver", "drivers", multiple=True, required=True)
+@click.option("--risk", "risks", multiple=True, required=True)
+@click.option("--catalyst", "catalysts", multiple=True, required=True)
+@click.option("--invalidation", "invalidations", multiple=True, required=True)
+@click.option("--financial-result-id", "financial_result_ids", multiple=True, required=True)
+@click.option("--source-document-id", "source_document_ids", multiple=True)
+@click.option("--user-id", default=None)
+def active_thesis_create_cmd(symbol: str, as_of: datetime, thesis: str, drivers: tuple[str, ...], risks: tuple[str, ...], catalysts: tuple[str, ...], invalidations: tuple[str, ...], financial_result_ids: tuple[str, ...], source_document_ids: tuple[str, ...], user_id: str | None) -> None:
+    """Create a PIT-safe, immutable active-thesis-v1 artifact; never trades."""
+    asyncio.run(_active_thesis_create(symbol, as_of, thesis, list(drivers), list(risks), list(catalysts), list(invalidations), list(financial_result_ids), list(source_document_ids), user_id))
+
+
+async def _active_thesis_create(symbol: str, as_of: datetime, thesis: str, drivers: list[str], risks: list[str], catalysts: list[str], invalidations: list[str], financial_result_ids: list[str], source_document_ids: list[str], user_id: str | None) -> None:
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.active_theses import ThesisEvidenceError, create_active_thesis
+    cutoff = as_of.replace(tzinfo=UTC) if as_of.tzinfo is None else as_of.astimezone(UTC)
+    try:
+        result_ids = [uuid.UUID(value) for value in financial_result_ids]
+        document_ids = [uuid.UUID(value) for value in source_document_ids]
+    except ValueError as exc:
+        raise click.UsageError("financial-result-id and source-document-id must be UUIDs") from exc
+    async with AsyncSessionLocal() as session:
+        try:
+            thesis_row = await create_active_thesis(session, user_id=user_id or get_settings().default_user_id, symbol=symbol, as_of=cutoff, thesis=thesis, drivers=drivers, risks=risks, catalysts=catalysts, invalidation_conditions=invalidations, financial_result_ids=result_ids, source_document_ids=document_ids)
+            await session.commit()
+        except ThesisEvidenceError as exc:
+            await session.rollback()
+            raise click.UsageError(str(exc)) from exc
+    click.echo(f"Created immutable active thesis id={thesis_row.id} version={thesis_row.thesis_version} model={thesis_row.thesis_model_version}")
+
+
 @cli.command("historical-pe-band-run")
 @click.argument("symbols", nargs=-1, required=True)
 @click.option("--as-of", required=True, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
@@ -3498,6 +3533,127 @@ async def _current_recommendations_run(user_id: str | None, as_of: datetime | No
         run = await generate(session, user_id=resolved, as_of=cutoff)
         await session.commit()
     click.echo(f"Phase 7A run {run.id} rule_version={run.rule_version} policy_layer=DISABLED")
+
+
+@cli.command("account-recommendation-run")
+@click.option("--broker", required=True, type=click.Choice(["ZERODHA"]))
+@click.option("--account-label", required=True)
+@click.option("--as-of", required=True, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
+@click.option("--validate-symbol", "validation_symbols", multiple=True, help="Optional explicit validation-only symbols; not a watchlist change.")
+@click.option("--user-id", default=None)
+def account_recommendation_run_cmd(broker: str, account_label: str, as_of: datetime, validation_symbols: tuple[str, ...], user_id: str | None) -> None:
+    """Run frozen recommendation-v1 using reconstructed current account context."""
+    asyncio.run(_account_recommendation_run(broker, account_label, as_of, list(validation_symbols), user_id))
+
+
+async def _account_recommendation_run(broker: str, account_label: str, as_of: datetime, validation_symbols: list[str], user_id: str | None) -> None:
+    from sqlalchemy import select
+    from investing_agent.db.models import RecommendationDecision
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.current_recommendations import generate
+    from investing_agent.services.recommendation_context import resolve_account_context
+    cutoff = as_of.replace(tzinfo=UTC) if as_of.tzinfo is None else as_of.astimezone(UTC)
+    resolved_user_id = user_id or get_settings().default_user_id
+    async with AsyncSessionLocal() as session:
+        context = await resolve_account_context(session, user_id=resolved_user_id, broker=broker, account_label=account_label, as_of_date=cutoff.date())
+        universe = sorted(set(context.symbols) | {symbol.upper() for symbol in validation_symbols})
+        run = await generate(session, user_id=resolved_user_id, as_of=cutoff, symbols=universe, account_context=context)
+        await session.commit()
+        rows = list((await session.execute(select(RecommendationDecision).where(RecommendationDecision.run_id == run.id).order_by(RecommendationDecision.symbol))).scalars())
+        click.echo(f"Account {broker}/{account_label} strategy={context.strategy_profile} holdings={len(context.holdings)} watchlist={len(context.watchlist_symbols)} market_value_complete={context.market_value_complete} cash_partial={context.cash_balance_partial} ({context.cash_balance_caveat})")
+        for row in rows:
+            p = row.portfolio_context or {}
+            v = row.valuation_inputs or {}
+            click.echo(f"{row.symbol}: provenance={p.get('provenance')} quantity={p.get('quantity')} avg_cost={p.get('average_cost')} market_price={p.get('market_price')} weight={p.get('concentration_pct')} thesis={'yes' if 'active_thesis_missing' not in row.data_gaps else 'no'} fair_value_mid={v.get('fair_value_mid')} action={row.final_action} confidence={row.confidence} gaps={','.join(row.data_gaps)}")
+    click.echo(f"Recommendation run {run.id} rule_version={run.rule_version} policy_layer=DISABLED")
+
+
+@cli.command("recommendation-review")
+@click.option("--decision-id", required=True, help="Frozen RecommendationDecision UUID to review.")
+@click.option("--verdict", required=True, type=click.Choice(["AGREE", "DISAGREE", "UNSURE"], case_sensitive=False))
+@click.option("--reason", default=None, help="Optional human review rationale; never changes the decision.")
+def recommendation_review_cmd(decision_id: str, verdict: str, reason: str | None) -> None:
+    """Append an immutable human observation to a frozen recommendation.
+
+    This command records only a supplied human verdict.  It does not alter a
+    recommendation, confidence, valuation, thesis, policy, or live behavior.
+    """
+    asyncio.run(_recommendation_review(decision_id, verdict.upper(), reason))
+
+
+async def _recommendation_review(decision_id: str, verdict: str, reason: str | None) -> None:
+    import uuid
+    from sqlalchemy import select
+    from investing_agent.db.models import RecommendationDecision, RecommendationReview
+    from investing_agent.db.session import AsyncSessionLocal
+
+    try:
+        parsed_id = uuid.UUID(decision_id)
+    except ValueError as exc:
+        raise click.UsageError("--decision-id must be a UUID") from exc
+
+    async with AsyncSessionLocal() as session:
+        decision = (await session.execute(
+            select(RecommendationDecision).where(RecommendationDecision.id == parsed_id)
+        )).scalar_one_or_none()
+        if decision is None:
+            raise click.UsageError(f"RecommendationDecision not found: {decision_id}")
+        review = RecommendationReview(
+            recommendation_decision_id=decision.id,
+            verdict=verdict,
+            reason=reason,
+        )
+        session.add(review)
+        await session.commit()
+    click.echo(
+        f"Recorded immutable review {review.id} for {decision.symbol} "
+        f"verdict={review.verdict}; recommendation remains unchanged."
+    )
+
+
+@cli.command("recommendation-review-report")
+@click.option("--run-id", default=None, help="Optional RecommendationRun UUID filter.")
+@click.option("--symbol", default=None, help="Optional symbol filter.")
+def recommendation_review_report_cmd(run_id: str | None, symbol: str | None) -> None:
+    """Report immutable human review observations; never changes decisions."""
+    asyncio.run(_recommendation_review_report(run_id, symbol.upper() if symbol else None))
+
+
+async def _recommendation_review_report(run_id: str | None, symbol: str | None) -> None:
+    import uuid
+    from sqlalchemy import select
+    from investing_agent.db.models import RecommendationDecision, RecommendationReview, RecommendationRun
+    from investing_agent.db.session import AsyncSessionLocal
+
+    parsed_run_id = None
+    if run_id:
+        try:
+            parsed_run_id = uuid.UUID(run_id)
+        except ValueError as exc:
+            raise click.UsageError("--run-id must be a UUID") from exc
+
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(RecommendationReview, RecommendationDecision, RecommendationRun)
+            .join(RecommendationDecision, RecommendationReview.recommendation_decision_id == RecommendationDecision.id)
+            .join(RecommendationRun, RecommendationDecision.run_id == RecommendationRun.id)
+            .order_by(RecommendationReview.reviewed_at.desc(), RecommendationReview.id.desc())
+        )
+        if parsed_run_id:
+            stmt = stmt.where(RecommendationDecision.run_id == parsed_run_id)
+        if symbol:
+            stmt = stmt.where(RecommendationDecision.symbol == symbol)
+        rows = (await session.execute(stmt)).all()
+
+    if not rows:
+        click.echo("No recommendation reviews recorded.")
+        return
+    for review, decision, run in rows:
+        click.echo(
+            f"{review.id} decision={decision.id} run={run.id} symbol={decision.symbol} "
+            f"action={decision.final_action} verdict={review.verdict} "
+            f"reviewed_at={review.reviewed_at.isoformat()} reason={review.reason or ''}"
+        )
 
 
 @cli.command("historical-agent-comparator-run")

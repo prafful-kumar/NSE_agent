@@ -8,8 +8,6 @@ To start the test DB: docker-compose up postgres_test -d
 """
 
 import pytest
-from datetime import datetime, timezone
-from decimal import Decimal
 
 pytestmark = pytest.mark.integration
 
@@ -125,3 +123,23 @@ class TestThesisRepository:
         )
         assert updated.status == "active"
         assert updated.thesis == "Upgraded to active"
+        assert updated.id != thesis.id
+        assert updated.supersedes_thesis_id == thesis.id
+        assert updated.thesis_version == thesis.thesis_version + 1
+        assert thesis.status == "watching"
+
+    async def test_database_rejects_in_place_thesis_mutation(self, db_session):
+        from sqlalchemy import update
+        from sqlalchemy.exc import DBAPIError
+        from investing_agent.db.models import InvestmentThesis
+        from investing_agent.db.repositories.thesis import ThesisRepository
+        from investing_agent.schemas.thesis import InvestmentThesisCreate
+
+        thesis = await ThesisRepository(db_session).create(
+            "immutable_test", InvestmentThesisCreate(symbol="BEL", status="active")
+        )
+        with pytest.raises(DBAPIError, match="immutable"):
+            await db_session.execute(
+                update(InvestmentThesis).where(InvestmentThesis.id == thesis.id).values(status="watching")
+            )
+        await db_session.rollback()
