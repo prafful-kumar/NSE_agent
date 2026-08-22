@@ -18,6 +18,7 @@ from typing import Literal
 from investing_agent.schemas.common import BaseSchema, TimestampedSchema
 
 AssumptionSource = Literal["deterministic", "llm"]
+EarningsHorizon = Literal["NEXT_QUARTER", "TTM", "FORWARD_12M", "FY_FORWARD"]
 
 
 class AssumptionItem(BaseSchema):
@@ -147,6 +148,7 @@ class EstimateRunCreate(BaseSchema):
     financial_period_id: uuid.UUID
     cutoff_at: datetime
     model_version: str
+    earnings_horizon: EarningsHorizon = "NEXT_QUARTER"
     feature_snapshot_id: uuid.UUID
     revenue_low: Decimal | None = None
     revenue_base: Decimal | None = None
@@ -170,6 +172,8 @@ class EstimateRunRead(TimestampedSchema):
     financial_period_id: uuid.UUID
     cutoff_at: datetime
     model_version: str
+    # Backward-compatible for immutable rows generated before migration 022.
+    earnings_horizon: EarningsHorizon = "NEXT_QUARTER"
     feature_snapshot_id: uuid.UUID
     revenue_low: Decimal | None
     revenue_base: Decimal | None

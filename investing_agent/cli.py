@@ -3357,6 +3357,130 @@ async def _candidate_policy_run(
     click.echo("\nCandidates recorded for manual review only; none are active in recommendations.")
 
 
+@cli.command("valuation-multiple-record")
+@click.argument("symbol")
+@click.option("--pe-low", required=True, type=Decimal)
+@click.option("--pe-mid", required=True, type=Decimal)
+@click.option("--pe-high", required=True, type=Decimal)
+@click.option("--effective-at", required=True, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
+@click.option("--rationale", required=True)
+@click.option("--provenance", required=True, help="Auditable source/policy reference; never an analyst target.")
+@click.option("--source-document-id", default=None)
+def valuation_multiple_record_cmd(symbol: str, pe_low: Decimal, pe_mid: Decimal, pe_high: Decimal, effective_at: datetime, rationale: str, provenance: str, source_document_id: str | None) -> None:
+    """Record an explicit immutable PE range for deterministic-valuation-v1."""
+    if not (pe_low > 0 and pe_low <= pe_mid <= pe_high):
+        raise click.UsageError("Require 0 < pe-low <= pe-mid <= pe-high.")
+    asyncio.run(_valuation_multiple_record(symbol, pe_low, pe_mid, pe_high, effective_at, rationale, provenance, source_document_id))
+
+
+async def _valuation_multiple_record(symbol: str, pe_low: Decimal, pe_mid: Decimal, pe_high: Decimal, effective_at: datetime, rationale: str, provenance: str, source_document_id: str | None) -> None:
+    from investing_agent.db.models import SourceDocument, ValuationMultipleInput
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.valuation import MODEL_VERSION
+    async with AsyncSessionLocal() as session:
+        company = await _resolve_company(session, symbol)
+        document_id = uuid.UUID(source_document_id) if source_document_id else None
+        if document_id is not None:
+            doc = await session.get(SourceDocument, document_id)
+            if doc is None or doc.company_id != company.id:
+                raise click.UsageError("source-document-id must belong to the specified company.")
+        cutoff = effective_at.replace(tzinfo=UTC) if effective_at.tzinfo is None else effective_at.astimezone(UTC)
+        row = ValuationMultipleInput(company_id=company.id, model_version=MODEL_VERSION, earnings_horizon="TTM", effective_at=cutoff, available_at=cutoff, pe_low=pe_low, pe_mid=pe_mid, pe_high=pe_high, rationale=rationale, provenance={"reference": provenance, "earnings_horizon": "TTM"}, source_document_id=document_id)
+        session.add(row)
+        await session.commit()
+    click.echo(f"Recorded immutable PE range id={row.id} for {symbol.upper()} ({pe_low}/{pe_mid}/{pe_high}).")
+
+
+@cli.command("valuation-run")
+@click.option("--symbols", "symbol_options", multiple=True, help="Validation-only explicit symbols; accepts `--symbols BEL HAL ...`.")
+@click.argument("symbols", nargs=-1)
+@click.option("--as-of", required=True, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
+def valuation_run_cmd(symbols: tuple[str, ...], symbol_options: tuple[str, ...], as_of: datetime) -> None:
+    """Run deterministic-valuation-v1 for an explicit validation cohort."""
+    selected = [*symbol_options, *symbols]
+    if not selected:
+        raise click.UsageError("Provide at least one symbol.")
+    asyncio.run(_valuation_run(selected, as_of))
+
+
+async def _valuation_run(symbols: list[str], as_of: datetime) -> None:
+    from investing_agent.db.repositories.company import CompanyRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.valuation import generate_for_company
+    cutoff = as_of.replace(tzinfo=UTC) if as_of.tzinfo is None else as_of.astimezone(UTC)
+    async with AsyncSessionLocal() as session:
+        company_repo = CompanyRepository(session)
+        for symbol in sorted({s.upper() for s in symbols}):
+            company = await company_repo.get_by_symbol(symbol)
+            if company is None:
+                click.echo(f"{symbol}: INSUFFICIENT_EVIDENCE company_not_resolved")
+                continue
+            outcome = await generate_for_company(session, company=company, as_of=cutoff)
+            if outcome.snapshot is None:
+                click.echo(f"{symbol}: INSUFFICIENT_EVIDENCE {', '.join(outcome.gaps)}")
+            else:
+                row = outcome.snapshot
+                click.echo(f"{symbol}: snapshot={row.id} EPS={row.eps_low}/{row.eps_mid}/{row.eps_high} PE={row.pe_low}/{row.pe_mid}/{row.pe_high} FV={row.fair_value_low}/{row.fair_value_mid}/{row.fair_value_high}")
+        await session.commit()
+
+
+@cli.command("historical-pe-band-run")
+@click.argument("symbols", nargs=-1, required=True)
+@click.option("--as-of", required=True, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
+def historical_pe_band_run_cmd(symbols: tuple[str, ...], as_of: datetime) -> None:
+    """Create PIT historical-pe-band-v1 PE evidence for explicit symbols."""
+    asyncio.run(_historical_pe_band_run(list(symbols), as_of))
+
+
+async def _historical_pe_band_run(symbols: list[str], as_of: datetime) -> None:
+    from investing_agent.db.repositories.company import CompanyRepository
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.historical_pe_band import generate_for_company
+    cutoff = as_of.replace(tzinfo=UTC) if as_of.tzinfo is None else as_of.astimezone(UTC)
+    async with AsyncSessionLocal() as session:
+        repo = CompanyRepository(session)
+        for symbol in sorted({symbol.upper() for symbol in symbols}):
+            company = await repo.get_by_symbol(symbol)
+            if company is None:
+                click.echo(f"{symbol}: INSUFFICIENT_EVIDENCE company_not_resolved")
+                continue
+            outcome = await generate_for_company(session, company=company, as_of=cutoff)
+            if outcome.multiple_input is None:
+                click.echo(f"{symbol}: INSUFFICIENT_EVIDENCE valid_observations={outcome.observation_count}; excluded={len(outcome.excluded)}")
+            else:
+                row = outcome.multiple_input
+                click.echo(f"{symbol}: multiple_input={row.id} observations={outcome.observation_count} PE={row.pe_low}/{row.pe_mid}/{row.pe_high}")
+        await session.commit()
+
+
+@cli.command("recommendation-run")
+@click.option("--symbols", "symbol_options", multiple=True, help="Validation-only explicit symbols; accepts `--symbols BEL HAL ...`.")
+@click.argument("symbols", nargs=-1)
+@click.option("--as-of", required=True, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))
+@click.option("--user-id", default=None)
+def recommendation_run_cmd(symbols: tuple[str, ...], symbol_options: tuple[str, ...], as_of: datetime, user_id: str | None) -> None:
+    """Run unchanged current-recommendation-v1 for an explicit validation cohort."""
+    selected = [*symbol_options, *symbols]
+    if not selected:
+        raise click.UsageError("Provide at least one symbol.")
+    asyncio.run(_recommendation_run(selected, as_of, user_id))
+
+
+async def _recommendation_run(symbols: list[str], as_of: datetime, user_id: str | None) -> None:
+    from sqlalchemy import select
+    from investing_agent.db.models import RecommendationDecision
+    from investing_agent.db.session import AsyncSessionLocal
+    from investing_agent.services.current_recommendations import generate
+    cutoff = as_of.replace(tzinfo=UTC) if as_of.tzinfo is None else as_of.astimezone(UTC)
+    async with AsyncSessionLocal() as session:
+        run = await generate(session, user_id=user_id or get_settings().default_user_id, as_of=cutoff, symbols=symbols)
+        await session.commit()
+        rows = list((await session.execute(select(RecommendationDecision).where(RecommendationDecision.run_id == run.id).order_by(RecommendationDecision.symbol))).scalars())
+        for row in rows:
+            click.echo(f"{row.symbol}: {row.final_action} confidence={row.confidence} gaps={','.join(row.data_gaps)}")
+    click.echo(f"Phase 7A validation run {run.id} rule_version={run.rule_version} policy_layer=DISABLED")
+
+
 @cli.command("current-recommendations-run")
 @click.option("--user-id", default=None)
 @click.option("--as-of", default=None, type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]))

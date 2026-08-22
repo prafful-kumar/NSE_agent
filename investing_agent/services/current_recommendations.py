@@ -11,12 +11,12 @@ from investing_agent.db.repositories.thesis import ThesisRepository
 RULE_VERSION = "current-recommendation-v1"
 STALE_VALUATION_DAYS = 90  # domain freshness guard, not outcome-tuned
 
-async def generate(session: AsyncSession, *, user_id: str, as_of: datetime | None = None) -> RecommendationRun:
+async def generate(session: AsyncSession, *, user_id: str, as_of: datetime | None = None, symbols: list[str] | None = None) -> RecommendationRun:
     as_of = as_of or datetime.now(UTC)
     snapshot = await PortfolioRepository(session).get_latest(user_id)
     held = {h.symbol.upper(): h for h in snapshot.holdings} if snapshot else {}
     watch = list((await session.execute(select(WatchlistItem).where(WatchlistItem.user_id == user_id, WatchlistItem.is_active.is_(True)))).scalars())
-    symbols = sorted(set(held) | {w.symbol.upper() for w in watch})
+    symbols = sorted({symbol.upper() for symbol in symbols}) if symbols is not None else sorted(set(held) | {w.symbol.upper() for w in watch})
     run = RecommendationRun(user_id=user_id, rule_version=RULE_VERSION, as_of=as_of, policy_layer_status="DISABLED")
     session.add(run); await session.flush()
     total = snapshot.total_value if snapshot and snapshot.total_value else Decimal("0")

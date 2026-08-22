@@ -727,14 +727,51 @@ class ValuationSnapshot(TimestampMixin, Base):
     company_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     valuation_method: Mapped[str] = mapped_column(String(50), nullable=False)
+    valuation_model_version: Mapped[str | None] = mapped_column(String(100))
+    earnings_basis: Mapped[str | None] = mapped_column(String(100))
+    # Explicit period represented by eps_*: NEXT_QUARTER|TTM|FORWARD_12M|FY_FORWARD.
+    earnings_horizon: Mapped[str | None] = mapped_column(String(30))
+    eps_low: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    eps_mid: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    eps_high: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    pe_low: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    pe_mid: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    pe_high: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     fair_value_low: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     fair_value_mid: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     fair_value_high: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     current_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     upside_downside_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    upside_downside_low_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    upside_downside_high_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     source_document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True)
     evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    assumptions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class ValuationMultipleInput(TimestampMixin, Base):
+    """Human-recorded, versioned PE range input for deterministic valuation.
+
+    This is deliberately not inferred from outcomes, prices, analyst targets,
+    or a model. A valuation cannot be created without one of these explicit
+    inputs being available at its cutoff.
+    """
+
+    __tablename__ = "valuation_multiple_inputs"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"), index=True, nullable=False)
+    model_version: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # The earnings horizon for which this PE range was constructed.
+    earnings_horizon: Mapped[str] = mapped_column(String(30), nullable=False, default="TTM")
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    pe_low: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    pe_mid: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    pe_high: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("source_documents.id"), index=True)
 
 
 class RecommendationRun(TimestampMixin, Base):
@@ -1460,6 +1497,9 @@ class EstimateRun(TimestampMixin, Base):
         DateTime(timezone=True), nullable=False, index=True
     )
     model_version: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # Phase 5A targets one FinancialPeriod; its EPS is therefore a next-quarter
+    # estimate, never an annual or trailing-twelve-month figure.
+    earnings_horizon: Mapped[str] = mapped_column(String(30), nullable=False, default="NEXT_QUARTER")
     feature_snapshot_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("feature_snapshots.id"), index=True, nullable=False
     )

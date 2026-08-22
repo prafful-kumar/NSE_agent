@@ -53,6 +53,12 @@ class EstimationService:
         cutoff_at: datetime,
         model_version: str = "deterministic-v1",
     ) -> EstimateRun:
+        """Estimate the supplied target FinancialPeriod.
+
+        The deterministic feature builder and estimator project exactly that
+        one quarterly period, so eps_low/base/high have the explicit
+        ``NEXT_QUARTER`` horizon. They must not be used as annual EPS.
+        """
         snapshot_row = await build_feature_snapshot(
             self._session, company_id, financial_period_id, cutoff_at
         )
@@ -79,6 +85,7 @@ class EstimationService:
             financial_period_id=financial_period_id,
             cutoff_at=cutoff_at,
             model_version=effective_model_version,
+            earnings_horizon="NEXT_QUARTER",
             feature_snapshot_id=snapshot_row.id,
             revenue_low=_q(computed.revenue.low, _REVENUE_QUANT),
             revenue_base=_q(computed.revenue.base, _REVENUE_QUANT),
